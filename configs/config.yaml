@@ -1,0 +1,21 @@
+adcm_url: "https://adcm.example.com"
+host_id: 101
+
+token_file: "/etc/secure/adcm.token"
+rules_path: "/etc/ad-status-sender/conf/rules.yaml"
+
+interval: "5s"
+http_timeout: "5s"
+concurrency: 0 # (0 = autodetect)
+log_bodies: false
+force_send_after: "240s"
+
+log_level: "info"   # one of: debug, info, warn, error
+log_format: "text"  # or: json
+
+tls:
+  ca_file: "/etc/pki/ca-trust/source/anchors/adcm-root.pem"  
+  cert_file: "/etc/ad-status-sender/client.crt"               
+  key_file: "/etc/ad-status-sender/client.key"                
+  server_name: "adcm.internal"                               
+  insecure_skip_verify: false                                  

@@ -1,0 +1,15 @@
+systemd:
+  - unit: "nginx.service"
+    components: ["501", "502"]
+  - unit_glob: "hbase-regionserver@*.service"
+    components: ["202","203"]
+
+docker:
+  - name: "webstack"           
+    components: ["201","202"]
+    containers:
+      names: ["nginx","redis:cluster-a"]
+  - name: "etl-by-labels"
+    components: ["301"]
+    containers:
+      labels: ["app=etl","stage=prod"]
