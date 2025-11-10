@@ -19,7 +19,7 @@ A lightweight Go agent that runs **on every host**, collects local statuses (sys
 ## Requirements
 
 - Go **≥ 1.24**
-- systemd (for systemd checks)
+- systemd **with D-Bus available** (for systemd checks)
 - Docker (for Docker checks)
 
 ---
@@ -93,9 +93,9 @@ docker:
 
 ### Status semantics
 
-- **systemd**: runs `systemctl is-active -q <unit>`  
-  → **0** if active; otherwise the **non-zero exit code** from systemctl.
-
+- **systemd**: queried via systemd **D-Bus** (`go-systemd/dbus`).  
+  Returns **0** if the unit’s `ActiveState == "active"`, otherwise **1** (including “unit not found”).
+  
 - **docker**:
   - `names`: **0** if **all** listed containers are `running`, else **1**.
   - `labels`: **0** if it finds **at least one** container by labels **and all found** are `running`, else **1**.
@@ -119,7 +119,7 @@ This prevents the receiver from marking entities stale when nothing changes.
 ## How it works
 
 Each `interval`:
-1) Expands `unit_glob` via `systemctl list-units` and checks all matched units.
+1) Expands `unit_glob` via systemd **D-Bus** (`ListUnitsByPatterns`) and checks each unit’s `ActiveState`.
 2) Checks Docker groups (by `names` or `labels`).
 3) Sends host heartbeat.
 
@@ -129,6 +129,7 @@ Each `interval`:
 
 HTTP client:
 - Connection pool, timeouts, TLS 1.2+, optional custom CA & mTLS.
+
 
 ---
 
