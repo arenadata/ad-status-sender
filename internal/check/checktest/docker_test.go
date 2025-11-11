@@ -1,14 +1,16 @@
-package check
+package checktest
 
 import (
 	"os"
 	"testing"
+
+	"github.com/arenadata/ad-status-sender/internal/check"
 )
 
 func TestDockerChecker_SkipIfNoDaemon(t *testing.T) {
 	// Heuristic: if no DOCKER_HOST and default socket likely absent in CI,
 	// just try NewDockerChecker and skip on error.
-	chk, err := NewDockerChecker()
+	chk, err := check.NewDockerChecker()
 	if err != nil {
 		t.Skip("docker daemon not available:", err)
 	}

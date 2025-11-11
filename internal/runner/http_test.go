@@ -1,8 +1,10 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,7 +14,7 @@ import (
 	"github.com/arenadata/ad-status-sender/internal/config"
 )
 
-func TestPostHostAndComponent(t *testing.T) {
+func TestHTTPPoster_HostAndComponent(t *testing.T) {
 	var cnt int32
 	var lastURL, lastAuth, lastBody string
 
@@ -32,11 +34,18 @@ func TestPostHostAndComponent(t *testing.T) {
 		HostID:  7,
 	}
 	httpc := makeHTTPClient(cfg)
-	r := &Runner{}
 
-	// host
-	if err := r.postHost(httpc, "TokenX", cfg, 0); err != nil {
-		t.Fatalf("postHost err: %v", err)
+	p := &httpPoster{
+		log:       slog.Default(),
+		c:         httpc,
+		adcmURL:   cfg.ADCMURL,
+		hostID:    cfg.HostID,
+		token:     "TokenX",
+		logBodies: true,
+	}
+
+	if err := p.PostHost(context.Background(), 0); err != nil {
+		t.Fatalf("PostHost err: %v", err)
 	}
 	if lastURL != "/status/api/v1/host/7/" || lastAuth != "Token TokenX" {
 		t.Fatalf("bad host req: url=%s auth=%s", lastURL, lastAuth)
@@ -46,9 +55,9 @@ func TestPostHostAndComponent(t *testing.T) {
 		t.Fatalf("bad host body: %s err=%v", lastBody, err)
 	}
 
-	// component
-	if err := r.postComponent(httpc, "ZZ", cfg, "42", 1); err != nil {
-		t.Fatalf("postComponent err: %v", err)
+	p.token = "ZZ"
+	if err := p.PostComponent(context.Background(), "42", 1); err != nil {
+		t.Fatalf("PostComponent err: %v", err)
 	}
 	if lastURL != "/status/api/v1/host/7/component/42/" || lastAuth != "Token ZZ" {
 		t.Fatalf("bad comp req: url=%s auth=%s", lastURL, lastAuth)

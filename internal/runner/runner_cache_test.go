@@ -5,10 +5,18 @@ import (
 	"time"
 )
 
+type fakeClock struct{ now time.Time }
+
+func (f *fakeClock) Now() time.Time                   { return f.now }
+func (f *fakeClock) NewTicker(_ time.Duration) Ticker { return nil }
+func (f *fakeClock) advance(d time.Duration)          { f.now = f.now.Add(d) }
+
 func TestShouldSendCache(t *testing.T) {
+	clk := &fakeClock{now: time.Unix(0, 0)}
 	r := &Runner{
 		cache:      make(map[string]lastSend),
 		forceAfter: 200 * time.Millisecond,
+		clk:        clk,
 	}
 	key := "comp:1:42"
 
@@ -29,8 +37,8 @@ func TestShouldSendCache(t *testing.T) {
 	}
 	r.markSent(key, 1)
 
-	// wait ≥ forceAfter → send even if unchanged
-	time.Sleep(r.forceAfter + 30*time.Millisecond)
+	// force resend after timeout
+	clk.advance(210 * time.Millisecond)
 	if !r.shouldSend(key, 1, r.forceAfter) {
 		t.Fatalf("force resend must trigger after forceAfter")
 	}
