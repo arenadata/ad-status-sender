@@ -1,8 +1,10 @@
-package check
+package checktest
 
 import (
 	"runtime"
 	"testing"
+
+	"github.com/arenadata/ad-status-sender/internal/check"
 )
 
 func TestSystemdHelpers_SkipIfUnavailable(t *testing.T) {
@@ -10,7 +12,7 @@ func TestSystemdHelpers_SkipIfUnavailable(t *testing.T) {
 		t.Skip("systemd tests only on linux")
 	}
 
-	cli, err := NewSystemdClient(t.Context())
+	cli, err := check.NewSystemdClient(t.Context())
 	if err != nil {
 		t.Skipf("systemd dbus not available: %v", err)
 	}

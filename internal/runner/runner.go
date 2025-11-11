@@ -33,6 +33,72 @@ const (
 	defaultForceSend   = 120 * time.Second
 )
 
+type httpPoster struct {
+	log       *slog.Logger
+	c         *http.Client
+	adcmURL   string
+	hostID    int
+	token     string
+	logBodies bool
+}
+
+func (p *httpPoster) PostHost(ctx context.Context, status int) error {
+	url := fmt.Sprintf("%s/status/api/v1/host/%d/", strings.TrimRight(p.adcmURL, "/"), p.hostID)
+	body, _ := json.Marshal(map[string]int{"status": status})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Token "+p.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if p.logBodies || resp.StatusCode >= http.StatusMultipleChoices {
+		data, _ := io.ReadAll(resp.Body)
+		p.log.InfoContext(
+			ctx,
+			"host post",
+			"url", url,
+			"code", resp.StatusCode,
+			"body", strings.TrimSpace(string(data)),
+		)
+	}
+	return nil
+}
+
+func (p *httpPoster) PostComponent(ctx context.Context, compID string, status int) error {
+	url := fmt.Sprintf(
+		"%s/status/api/v1/host/%d/component/%s/",
+		strings.TrimRight(p.adcmURL, "/"),
+		p.hostID,
+		compID,
+	)
+	body, _ := json.Marshal(map[string]int{"status": status})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Token "+p.token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.c.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if p.logBodies || resp.StatusCode >= http.StatusMultipleChoices {
+		data, _ := io.ReadAll(resp.Body)
+		p.log.InfoContext(
+			ctx,
+			"status post",
+			"url", url,
+			"code", resp.StatusCode,
+			"body", strings.TrimSpace(string(data)),
+		)
+	}
+	return nil
+}
+
 type Runner struct {
 	cfgPath string
 	log     *slog.Logger
@@ -46,12 +112,14 @@ type Runner struct {
 	stopWatch chan struct{}
 
 	tickerMu sync.Mutex
-	ticker   *time.Ticker
+	ticker   Ticker
 	jobs     chan func()
 	cancel   context.CancelFunc
 
-	dck *check.DockerChecker
-	sd  *check.SystemdClient
+	sd   check.Systemd
+	dck  check.Docker
+	post Poster
+	clk  Clock
 
 	cacheMu    sync.Mutex
 	cache      map[string]lastSend // key -> last
@@ -67,10 +135,34 @@ func NewWithLogger(cfgPath string, logger *slog.Logger) *Runner {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Runner{cfgPath: cfgPath, log: logger}
+	return NewWithDeps(cfgPath, logger, nil, nil, nil, nil)
 }
 
 func New(cfgPath string) *Runner { return NewWithLogger(cfgPath, slog.Default()) }
+
+func NewWithDeps(
+	cfgPath string,
+	logger *slog.Logger,
+	sd check.Systemd,
+	dck check.Docker,
+	post Poster,
+	clk Clock,
+) *Runner {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if clk == nil {
+		clk = realClock{}
+	}
+	return &Runner{
+		cfgPath: cfgPath,
+		log:     logger,
+		sd:      sd,
+		dck:     dck,
+		post:    post,
+		clk:     clk,
+	}
+}
 
 func (r *Runner) Start() error {
 	if err := r.reload(); err != nil {
@@ -132,8 +224,7 @@ func (r *Runner) startRulesWatcher() {
 	go func() {
 		err := rules.Watch(r.stopWatch, r.cfg.RulesPath, func(rr rules.Rules) {
 			r.ruleStore.Set(rr)
-			r.log.Info("rules reloaded",
-				"systemd", len(rr.Systemd), "docker", len(rr.Docker))
+			r.log.Info("rules reloaded", "systemd", len(rr.Systemd), "docker", len(rr.Docker))
 		})
 		if err != nil {
 			r.log.Error("rules watch", "err", err)
@@ -174,8 +265,6 @@ func (r *Runner) reload() error {
 		return tokenErr
 	}
 
-	client := makeHTTPClient(c)
-
 	if r.dck == nil {
 		if d, err := check.NewDockerChecker(); err == nil {
 			r.dck = d
@@ -191,10 +280,29 @@ func (r *Runner) reload() error {
 		}
 	}
 
+	httpc := makeHTTPClient(c)
+
+	if r.post == nil {
+		r.post = &httpPoster{
+			log:       r.log,
+			c:         httpc,
+			adcmURL:   c.ADCMURL,
+			hostID:    c.HostID,
+			token:     tok,
+			logBodies: c.LogBodies,
+		}
+	} else if hp, ok := r.post.(*httpPoster); ok {
+		hp.c = httpc
+		hp.adcmURL = c.ADCMURL
+		hp.hostID = c.HostID
+		hp.token = tok
+		hp.logBodies = c.LogBodies
+	}
+
 	r.mu.Lock()
 	r.cfg = c
 	r.token = tok
-	r.client = client
+	r.client = httpc
 	r.forceAfter = config.MustDuration(c.ForceSendAfter, defaultForceSend)
 	r.mu.Unlock()
 
@@ -217,16 +325,12 @@ func buildTransport(c config.Config) *http.Transport {
 	if !strings.HasPrefix(strings.ToLower(c.ADCMURL), "https://") {
 		return tr
 	}
-	tlsConf := buildTLSConfig(c)
-	tr.TLSClientConfig = tlsConf
+	tr.TLSClientConfig = buildTLSConfig(c)
 	return tr
 }
 
 func buildTLSConfig(c config.Config) *tls.Config {
-	tlsConf := &tls.Config{
-		MinVersion: tls.VersionTLS12, // gosec: G402
-	}
-
+	tlsConf := &tls.Config{MinVersion: tls.VersionTLS12}
 	roots, sysErr := x509.SystemCertPool()
 	if sysErr != nil || roots == nil {
 		roots = x509.NewCertPool()
@@ -239,9 +343,7 @@ func buildTLSConfig(c config.Config) *tls.Config {
 	tlsConf.RootCAs = roots
 
 	if c.TLS.CertFile != "" && c.TLS.KeyFile != "" {
-		if cert, ckErr := tls.LoadX509KeyPair(
-			c.TLS.CertFile, c.TLS.KeyFile,
-		); ckErr == nil {
+		if cert, ckErr := tls.LoadX509KeyPair(c.TLS.CertFile, c.TLS.KeyFile); ckErr == nil {
 			tlsConf.Certificates = []tls.Certificate{cert}
 		}
 	}
@@ -269,14 +371,17 @@ func (r *Runner) resetTicker(d time.Duration) {
 	if r.ticker != nil {
 		r.ticker.Stop()
 	}
-	r.ticker = time.NewTicker(d)
+	if r.clk == nil {
+		r.clk = realClock{}
+	}
+	r.ticker = r.clk.NewTicker(d)
 }
 
 func (r *Runner) loop(ctx context.Context) {
 	r.scanOnce(ctx)
 	for {
 		r.tickerMu.Lock()
-		c := r.ticker.C
+		c := r.ticker.C()
 		r.tickerMu.Unlock()
 		select {
 		case <-ctx.Done():
@@ -289,26 +394,20 @@ func (r *Runner) loop(ctx context.Context) {
 }
 
 func (r *Runner) scanOnce(ctx context.Context) {
-	cfg, token, httpc, force := r.snapshot()
-
-	r.scanSystemd(ctx, cfg, token, httpc, force)
-	r.scanDocker(cfg, token, httpc, force)
-	r.sendHeartbeat(cfg, token, httpc, force)
+	cfg, token, force := r.snapshot()
+	_ = token
+	r.scanSystemd(ctx, cfg, force)
+	r.scanDocker(ctx, cfg, force)
+	r.sendHeartbeat(ctx, cfg, force)
 }
 
-func (r *Runner) snapshot() (config.Config, string, *http.Client, time.Duration) {
+func (r *Runner) snapshot() (config.Config, string, time.Duration) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.cfg, r.token, r.client, r.forceAfter
+	return r.cfg, r.token, r.forceAfter
 }
 
-func (r *Runner) scanSystemd(
-	ctx context.Context,
-	cfg config.Config,
-	token string,
-	httpc *http.Client,
-	forceAfter time.Duration,
-) {
+func (r *Runner) scanSystemd(ctx context.Context, cfg config.Config, forceAfter time.Duration) {
 	rr := r.ruleStore.Get()
 	for _, rule := range rr.Systemd {
 		comps := append([]string(nil), rule.Components...)
@@ -316,10 +415,8 @@ func (r *Runner) scanSystemd(
 		if rule.Unit != "" {
 			units = append(units, rule.Unit)
 		}
-		if rule.UnitGlob != "" {
-			if r.sd != nil {
-				units = append(units, r.sd.ExpandUnitsByGlob(ctx, rule.UnitGlob)...)
-			}
+		if rule.UnitGlob != "" && r.sd != nil {
+			units = append(units, r.sd.ExpandUnitsByGlob(ctx, rule.UnitGlob)...)
 		}
 		for _, unit := range units {
 			unitLocal := unit
@@ -329,19 +426,14 @@ func (r *Runner) scanSystemd(
 					st = r.sd.SystemdStatus(ctx, unitLocal)
 				}
 				for _, comp := range comps {
-					r.maybePostComponent(httpc, token, cfg, comp, st, forceAfter)
+					r.maybePostComponent(ctx, cfg, comp, st, forceAfter)
 				}
 			})
 		}
 	}
 }
 
-func (r *Runner) scanDocker(
-	cfg config.Config,
-	token string,
-	httpc *http.Client,
-	forceAfter time.Duration,
-) {
+func (r *Runner) scanDocker(ctx context.Context, cfg config.Config, forceAfter time.Duration) {
 	rr := r.ruleStore.Get()
 	for _, d := range rr.Docker {
 		comps := append([]string(nil), d.Components...)
@@ -356,21 +448,16 @@ func (r *Runner) scanDocker(
 				}
 			}
 			for _, comp := range comps {
-				r.maybePostComponent(httpc, token, cfg, comp, status, forceAfter)
+				r.maybePostComponent(ctx, cfg, comp, status, forceAfter)
 			}
 		})
 	}
 }
 
-func (r *Runner) sendHeartbeat(
-	cfg config.Config,
-	token string,
-	httpc *http.Client,
-	forceAfter time.Duration,
-) {
+func (r *Runner) sendHeartbeat(ctx context.Context, cfg config.Config, forceAfter time.Duration) {
 	r.enqueue(func() {
 		const ok = 0
-		r.maybePostHost(httpc, token, cfg, ok, forceAfter)
+		r.maybePostHost(ctx, cfg, ok, forceAfter)
 	})
 }
 
@@ -383,8 +470,7 @@ func (r *Runner) enqueue(fn func()) {
 }
 
 func (r *Runner) maybePostComponent(
-	httpc *http.Client,
-	token string,
+	ctx context.Context,
 	cfg config.Config,
 	compID string,
 	status int,
@@ -394,34 +480,34 @@ func (r *Runner) maybePostComponent(
 	if !r.shouldSend(key, status, forceAfter) {
 		return
 	}
-	_ = r.postComponent(httpc, token, cfg, compID, status)
+	if r.post != nil {
+		if err := r.post.PostComponent(ctx, compID, status); err != nil {
+			r.log.WarnContext(ctx, "post component failed", "comp", compID, "err", err)
+			return
+		}
+	}
 	r.markSent(key, status)
 }
 
-func (r *Runner) maybePostHost(
-	httpc *http.Client,
-	token string,
-	cfg config.Config,
-	status int,
-	forceAfter time.Duration,
-) {
+func (r *Runner) maybePostHost(ctx context.Context, cfg config.Config, status int, forceAfter time.Duration) {
 	key := fmt.Sprintf("host:%d", cfg.HostID)
 	if !r.shouldSend(key, status, forceAfter) {
 		return
 	}
-	_ = r.postHost(httpc, token, cfg, status)
+	if r.post != nil {
+		if err := r.post.PostHost(ctx, status); err != nil {
+			r.log.WarnContext(ctx, "post host failed", "host", cfg.HostID, "err", err)
+			return
+		}
+	}
 	r.markSent(key, status)
 }
 
-func (r *Runner) shouldSend(
-	key string,
-	status int,
-	forceAfter time.Duration,
-) bool {
+func (r *Runner) shouldSend(key string, status int, forceAfter time.Duration) bool {
 	r.cacheMu.Lock()
 	defer r.cacheMu.Unlock()
 	prev, ok := r.cache[key]
-	now := time.Now()
+	now := r.clk.Now()
 	if !ok {
 		return true
 	}
@@ -433,61 +519,6 @@ func (r *Runner) shouldSend(
 
 func (r *Runner) markSent(key string, status int) {
 	r.cacheMu.Lock()
-	r.cache[key] = lastSend{status: status, lastTime: time.Now()}
+	r.cache[key] = lastSend{status: status, lastTime: r.clk.Now()}
 	r.cacheMu.Unlock()
-}
-
-func (r *Runner) postComponent(
-	httpc *http.Client,
-	token string,
-	cfg config.Config,
-	compID string,
-	status int,
-) error {
-	url := fmt.Sprintf("%s/status/api/v1/host/%d/component/%s/",
-		strings.TrimRight(cfg.ADCMURL, "/"), cfg.HostID, compID)
-
-	body, _ := json.Marshal(map[string]int{"status": status})
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Token "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if cfg.LogBodies || resp.StatusCode >= http.StatusMultipleChoices {
-		data, _ := io.ReadAll(resp.Body)
-		r.log.Info("status post",
-			"url", url, "code", resp.StatusCode, "body", strings.TrimSpace(string(data)))
-	}
-	return nil
-}
-
-func (r *Runner) postHost(
-	httpc *http.Client,
-	token string,
-	cfg config.Config,
-	status int,
-) error {
-	url := fmt.Sprintf("%s/status/api/v1/host/%d/",
-		strings.TrimRight(cfg.ADCMURL, "/"), cfg.HostID)
-
-	body, _ := json.Marshal(map[string]int{"status": status})
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Token "+token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if cfg.LogBodies || resp.StatusCode >= http.StatusMultipleChoices {
-		data, _ := io.ReadAll(resp.Body)
-		r.log.Info("host post",
-			"url", url, "code", resp.StatusCode, "body", strings.TrimSpace(string(data)))
-	}
-	return nil
 }
