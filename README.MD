@@ -167,3 +167,9 @@ golangci-lint run
 - A component can appear in multiple rules — the agent will post all related statuses.
 
 ---
+
+
+## todo
+1. shared hosts
+2. db
+3. migration old rules into db
