@@ -114,6 +114,25 @@ func TestRulesRevisionIncrements(t *testing.T) {
 
 	mustUpdate(ctx, t, s, func(_ context.Context, _ *sql.Tx) error { return nil })
 
+	rNoop, err := s.GetRulesRevision(ctx)
+	if err != nil {
+		t.Fatalf("GetRulesRevision(noop): %v", err)
+	}
+	if rNoop != initialRev {
+		t.Fatalf("revision after noop=%d, want %d", rNoop, initialRev)
+	}
+
+	mustUpdate(ctx, t, s, func(ctx context.Context, tx *sql.Tx) error {
+		rid, upErr := UpsertSystemdRuleTx(ctx, tx, "rev-test", true, "dummy.service", "")
+		if upErr != nil {
+			return upErr
+		}
+		if setErr := SetRuleComponentsTx(ctx, tx, rid, []string{"9999"}); setErr != nil {
+			return setErr
+		}
+		return nil
+	})
+
 	r2, err := s.GetRulesRevision(ctx)
 	if err != nil {
 		t.Fatalf("GetRulesRevision(2): %v", err)

@@ -22,12 +22,14 @@ func (s *Store) GetRulesRevision(ctx context.Context) (int64, error) {
 	return rev, nil
 }
 
-func (s *Store) UpdateRules(ctx context.Context, apply func(tx *sql.Tx) error) error {
+func (s *Store) UpdateRules(
+	ctx context.Context,
+	apply func(tx *sql.Tx) error,
+) error {
 	tx, beginErr := s.db.BeginTx(ctx, nil)
 	if beginErr != nil {
 		return beginErr
 	}
-
 	defer func() {
 		if p := recover(); p != nil {
 			_ = tx.Rollback()
@@ -35,26 +37,43 @@ func (s *Store) UpdateRules(ctx context.Context, apply func(tx *sql.Tx) error) e
 		}
 	}()
 
-	appErr := apply(tx)
-	if appErr != nil {
+	var before int64
+	if qErr := tx.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&before); qErr != nil {
+		_ = tx.Rollback()
+		return qErr
+	}
+
+	if appErr := apply(tx); appErr != nil {
 		_ = tx.Rollback()
 		return appErr
 	}
 
-	if _, updErr := tx.ExecContext(ctx, `
-		UPDATE rules_revision
-		   SET revision = revision + 1,
-		       updated_at = strftime('%s','now')
-		 WHERE id = 1`,
-	); updErr != nil {
+	var after int64
+	if q2Err := tx.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&after); q2Err != nil {
 		_ = tx.Rollback()
-		return updErr
+		return q2Err
+	}
+
+	if after-before > 0 {
+		if incErr := s.bumpRevisionTx(ctx, tx); incErr != nil {
+			_ = tx.Rollback()
+			return incErr
+		}
 	}
 
 	if commitErr := tx.Commit(); commitErr != nil {
 		return commitErr
 	}
 	return nil
+}
+
+func (s *Store) bumpRevisionTx(ctx context.Context, tx *sql.Tx) error {
+	_, updErr := tx.ExecContext(ctx, `
+		UPDATE rules_revision
+		   SET revision = revision + 1,
+		       updated_at = strftime('%s','now')
+		 WHERE id = 1`)
+	return updErr
 }
 
 func UpsertSystemdRuleTx(
