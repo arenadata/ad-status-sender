@@ -44,7 +44,9 @@ type httpPoster struct {
 
 func (p *httpPoster) PostHost(ctx context.Context, status int) error {
 	url := fmt.Sprintf("%s/status/api/v1/host/%d/", strings.TrimRight(p.adcmURL, "/"), p.hostID)
-	body, _ := json.Marshal(map[string]int{"status": status})
+	payload := map[string]int{"status": status}
+	body, _ := json.Marshal(payload)
+
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Token "+p.token)
 	req.Header.Set("Content-Type", "application/json")
@@ -62,6 +64,7 @@ func (p *httpPoster) PostHost(ctx context.Context, status int) error {
 			"host post",
 			"url", url,
 			"code", resp.StatusCode,
+			"sent_status", status,
 			"body", strings.TrimSpace(string(data)),
 		)
 	}
@@ -75,7 +78,9 @@ func (p *httpPoster) PostComponent(ctx context.Context, compID string, status in
 		p.hostID,
 		compID,
 	)
-	body, _ := json.Marshal(map[string]int{"status": status})
+	payload := map[string]int{"status": status}
+	body, _ := json.Marshal(payload)
+
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	req.Header.Set("Authorization", "Token "+p.token)
 	req.Header.Set("Content-Type", "application/json")
@@ -92,7 +97,9 @@ func (p *httpPoster) PostComponent(ctx context.Context, compID string, status in
 			ctx,
 			"status post",
 			"url", url,
+			"comp", compID,
 			"code", resp.StatusCode,
+			"sent_status", status,
 			"body", strings.TrimSpace(string(data)),
 		)
 	}
