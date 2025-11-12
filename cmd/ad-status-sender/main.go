@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/arenadata/ad-status-sender/internal/config"
 	"github.com/arenadata/ad-status-sender/internal/runner"
@@ -45,5 +48,9 @@ func main() {
 	}
 	_, _ = sd.SdNotify(false, sd.SdNotifyReady)
 
-	select {}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	<-ctx.Done()
+	r.Stop()
 }
