@@ -188,6 +188,11 @@ func DeleteRuleTx(ctx context.Context, tx *sql.Tx, ruleID int64) error {
 	return delErr
 }
 
+func ClearRulesTx(ctx context.Context, tx *sql.Tx) error {
+	_, delErr := tx.ExecContext(ctx, `DELETE FROM rule`)
+	return delErr
+}
+
 func (s *Store) LoadRulesForHost(ctx context.Context, hostID int) (rules.Rules, error) {
 	out := rules.Rules{}
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -295,8 +296,12 @@ func TestServicesDir_FullListing(t *testing.T) {
 		}
 	}
 	for unit, comp := range files {
-		if got[unit] != comp {
-			t.Fatalf("unit %q: got component %q, want %q", unit, got[unit], comp)
+		wantUnit := unit
+		if !strings.Contains(unit, ".") {
+			wantUnit = unit + ".service"
+		}
+		if got[wantUnit] != comp {
+			t.Fatalf("unit %q: got component %q, want %q", wantUnit, got[wantUnit], comp)
 		}
 	}
 }

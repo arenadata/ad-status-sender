@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -62,6 +64,32 @@ func waitUntil(t *testing.T, cond func() bool, timeout time.Duration) {
 	if !cond() {
 		t.Fatalf("condition not met within %v", timeout)
 	}
+}
+
+func newLegacyRunner(t *testing.T, legacyDir string, hostID int) *Runner {
+	t.Helper()
+	rulesDB := filepath.Join(legacyDir, "rules.db")
+	r := NewWithDeps("unused.yaml", nil, nil, nil, nil, nil)
+	r.mu.Lock()
+	r.cfg = config.Config{
+		HostID:      hostID,
+		RulesSource: "legacy",
+		RulesDB:     rulesDB,
+		LegacyDir:   legacyDir,
+	}
+	r.mu.Unlock()
+	if err := r.openDB(rulesDB); err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() {
+		if r.db != nil {
+			_ = r.db.Close()
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r.startLegacyWatcher(ctx)
+	return r
 }
 
 func TestRunner_SendsStatuses_WithCacheAndForceResend(t *testing.T) {
@@ -269,4 +297,106 @@ func TestRunner_RulesReloadAddsComponent(t *testing.T) {
 	if len(ss) != 1 || ss[0].IsHost || ss[0].CompID != "502" || ss[0].Status != 1 {
 		t.Fatalf("want one comp event 502=1 after rules update, got: %+v", ss)
 	}
+}
+
+func TestRunner_LegacyWatcherTriggersSync(t *testing.T) {
+	legacyDir := t.TempDir()
+	servicesDir := filepath.Join(legacyDir, "services")
+	dockerDir := filepath.Join(legacyDir, "docker")
+	hostsDir := filepath.Join(legacyDir, "hosts")
+	for _, dir := range []string{servicesDir, dockerDir, hostsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	r := newLegacyRunner(t, legacyDir, 7)
+
+	target := filepath.Join(servicesDir, "nginx.service")
+	for range 6 {
+		if err := os.WriteFile(target, []byte("501\n"), 0o644); err != nil {
+			t.Fatalf("write service: %v", err)
+		}
+		time.Sleep(250 * time.Millisecond) // allow debounce to fire
+		rr := r.ruleStore.Get()
+		if len(rr.Systemd) == 1 {
+			rule := rr.Systemd[0]
+			if rule.Unit == "nginx.service" && len(rule.Components) == 1 && rule.Components[0] == "501" {
+				return
+			}
+		}
+	}
+	t.Fatalf("condition not met within 1.5s")
+}
+
+func TestRunner_LegacyWatcherDockerTriggersSync(t *testing.T) {
+	legacyDir := t.TempDir()
+	servicesDir := filepath.Join(legacyDir, "services")
+	dockerDir := filepath.Join(legacyDir, "docker")
+	hostsDir := filepath.Join(legacyDir, "hosts")
+	for _, dir := range []string{servicesDir, dockerDir, hostsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	r := newLegacyRunner(t, legacyDir, 7)
+
+	target := filepath.Join(dockerDir, "core")
+	for range 6 {
+		if err := os.WriteFile(target, []byte("601\n\ncache\n"), 0o644); err != nil {
+			t.Fatalf("write docker rule: %v", err)
+		}
+		time.Sleep(250 * time.Millisecond)
+		rr := r.ruleStore.Get()
+		if len(rr.Docker) == 1 {
+			rule := rr.Docker[0]
+			if len(rule.Components) == 1 && rule.Components[0] == "601" &&
+				len(rule.Containers.Names) == 1 && rule.Containers.Names[0] == "cache" {
+				return
+			}
+		}
+	}
+	t.Fatalf("condition not met within 1.5s")
+}
+
+func TestRunner_LegacyWatcherHostsAffectScope(t *testing.T) {
+	legacyDir := t.TempDir()
+	servicesDir := filepath.Join(legacyDir, "services")
+	dockerDir := filepath.Join(legacyDir, "docker")
+	hostsDir := filepath.Join(legacyDir, "hosts")
+	for _, dir := range []string{servicesDir, dockerDir, hostsDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+
+	r := newLegacyRunner(t, legacyDir, 7)
+
+	if err := os.WriteFile(filepath.Join(servicesDir, "nginx.service"), []byte("501\n"), 0o644); err != nil {
+		t.Fatalf("write service: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(hostsDir, "9"), []byte(""), 0o644); err != nil {
+		t.Fatalf("write host 9: %v", err)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if len(r.ruleStore.Get().Systemd) != 0 {
+		t.Fatalf("expected no rules for host 7 when scope is 9")
+	}
+
+	if err := os.WriteFile(filepath.Join(hostsDir, "7"), []byte(""), 0o644); err != nil {
+		t.Fatalf("write host 7: %v", err)
+	}
+	for range 6 {
+		time.Sleep(250 * time.Millisecond)
+		rr := r.ruleStore.Get()
+		if len(rr.Systemd) == 1 {
+			rule := rr.Systemd[0]
+			if rule.Unit == "nginx.service" && len(rule.Components) == 1 && rule.Components[0] == "501" {
+				return
+			}
+		}
+	}
+	t.Fatalf("condition not met within 1.5s")
 }

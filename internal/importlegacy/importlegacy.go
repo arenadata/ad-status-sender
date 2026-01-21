@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/arenadata/ad-status-sender/internal/rulesimport"
 	"github.com/arenadata/ad-status-sender/internal/storage/sqlite"
 )
 
@@ -78,12 +79,12 @@ func ensureHostsTx(ctx context.Context, tx *sql.Tx, hostIDs []int) error {
 }
 
 func importServiceFileTx(ctx context.Context, tx *sql.Tx, path string, namePrefix string, hostIDs []int) error {
-	unit := filepath.Base(path)
+	unit := normalizeServiceUnit(filepath.Base(path))
 	comps, linesErr := readLines(path)
 	if linesErr != nil {
 		return linesErr
 	}
-	comps = dedupTrim(comps)
+	comps = rulesimport.DedupTrim(comps)
 	if len(comps) == 0 {
 		return nil
 	}
@@ -95,12 +96,17 @@ func importServiceFileTx(ctx context.Context, tx *sql.Tx, path string, namePrefi
 	if setErr := sqlite.SetRuleComponentsTx(ctx, tx, ruleID, comps); setErr != nil {
 		return setErr
 	}
-	if len(hostIDs) > 0 {
-		if scErr := sqlite.SetRuleHostScopeTx(ctx, tx, ruleID, hostIDs); scErr != nil {
-			return scErr
-		}
+	if scErr := rulesimport.ApplyHostScope(ctx, tx, ruleID, hostIDs); scErr != nil {
+		return scErr
 	}
 	return nil
+}
+
+func normalizeServiceUnit(name string) string {
+	if strings.Contains(name, ".") {
+		return name
+	}
+	return name + ".service"
 }
 
 func importDockerFileTx(ctx context.Context, tx *sql.Tx, path string, ruleName string, hostIDs []int) error {
@@ -108,9 +114,9 @@ func importDockerFileTx(ctx context.Context, tx *sql.Tx, path string, ruleName s
 	if rdErr != nil {
 		return rdErr
 	}
-	comps = dedupTrim(comps)
-	names = dedupTrim(names)
-	labels = dedupTrim(labels)
+	comps = rulesimport.DedupTrim(comps)
+	names = rulesimport.DedupTrim(names)
+	labels = rulesimport.DedupTrim(labels)
 	if len(comps) == 0 || (len(names) == 0 && len(labels) == 0) {
 		return nil
 	}
@@ -121,10 +127,8 @@ func importDockerFileTx(ctx context.Context, tx *sql.Tx, path string, ruleName s
 	if setErr := sqlite.SetRuleComponentsTx(ctx, tx, ruleID, comps); setErr != nil {
 		return setErr
 	}
-	if len(hostIDs) > 0 {
-		if scErr := sqlite.SetRuleHostScopeTx(ctx, tx, ruleID, hostIDs); scErr != nil {
-			return scErr
-		}
+	if scErr := rulesimport.ApplyHostScope(ctx, tx, ruleID, hostIDs); scErr != nil {
+		return scErr
 	}
 	return nil
 }
@@ -240,9 +244,9 @@ func parseDockerFormatA(lines []string, sep int) ([]string, []string, []string, 
 			}
 		}
 	}
-	comps = dedupTrim(comps)
-	names = dedupTrim(names)
-	labels = dedupTrim(labels)
+	comps = rulesimport.DedupTrim(comps)
+	names = rulesimport.DedupTrim(names)
+	labels = rulesimport.DedupTrim(labels)
 	return comps, names, labels, nil
 }
 
@@ -268,31 +272,14 @@ func parseDockerFormatB(lines []string) ([]string, []string, []string, error) {
 			}
 		}
 	}
-	comps = dedupTrim(comps)
-	names = dedupTrim(names)
-	labels = dedupTrim(labels)
+	comps = rulesimport.DedupTrim(comps)
+	names = rulesimport.DedupTrim(names)
+	labels = rulesimport.DedupTrim(labels)
 	return comps, names, labels, nil
 }
 
 func looksLikeLabel(s string) bool {
 	return strings.IndexByte(s, '=') > 0
-}
-
-func dedupTrim(in []string) []string {
-	seen := make(map[string]struct{}, len(in))
-	out := make([]string, 0, len(in))
-	for _, v := range in {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			continue
-		}
-		if _, ok := seen[v]; ok {
-			continue
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	return out
 }
 
 func sameStringsIgnoreOrder(a, b []string) bool {
