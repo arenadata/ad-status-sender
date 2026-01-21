@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,6 +31,7 @@ type Client struct {
 	tokenMu       sync.RWMutex
 	http          *http.Client
 	log           *slog.Logger
+	logBodies     atomic.Bool
 }
 
 func New(baseURL, token string, httpClient *http.Client, logger *slog.Logger) *Client {
@@ -125,6 +127,10 @@ func (c *Client) setToken(token string) {
 	c.tokenMu.Lock()
 	c.token = strings.TrimSpace(token)
 	c.tokenMu.Unlock()
+}
+
+func (c *Client) SetLogBodies(enabled bool) {
+	c.logBodies.Store(enabled)
 }
 
 func (c *Client) doOnce(
@@ -397,8 +403,22 @@ func (c *Client) PostHostStatus(ctx context.Context, hostID int, status int) err
 		return err
 	}
 	defer resp.Body.Close()
+	needBody := c.logBodies.Load() || resp.StatusCode/100 != statusClassSuccess
+	var b []byte
+	if needBody {
+		b, _ = io.ReadAll(resp.Body)
+	}
+	if c.logBodies.Load() {
+		c.log.InfoContext(
+			ctx,
+			"host post",
+			"url", url,
+			"code", resp.StatusCode,
+			"sent_status", status,
+			"body", strings.TrimSpace(string(b)),
+		)
+	}
 	if resp.StatusCode/100 != statusClassSuccess {
-		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("post host status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
@@ -413,8 +433,23 @@ func (c *Client) PostComponentStatus(ctx context.Context, hostID int, compID str
 		return err
 	}
 	defer resp.Body.Close()
+	needBody := c.logBodies.Load() || resp.StatusCode/100 != statusClassSuccess
+	var b []byte
+	if needBody {
+		b, _ = io.ReadAll(resp.Body)
+	}
+	if c.logBodies.Load() {
+		c.log.InfoContext(
+			ctx,
+			"status post",
+			"url", url,
+			"comp", compID,
+			"code", resp.StatusCode,
+			"sent_status", status,
+			"body", strings.TrimSpace(string(b)),
+		)
+	}
 	if resp.StatusCode/100 != statusClassSuccess {
-		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("post component status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil

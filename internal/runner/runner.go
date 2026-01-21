@@ -382,6 +382,7 @@ func (r *Runner) reload() error {
 		return err
 	}
 	r.adcm = r.buildADCMClient(auth, tok, httpc)
+	r.adcm.SetLogBodies(auth.cfg.LogBodies)
 
 	r.updatePoster(auth.cfg)
 
@@ -515,6 +516,9 @@ func (r *Runner) updatePoster(cfg config.Config) {
 		ap.client = r.adcm
 		ap.hostID = cfg.HostID
 		ap.logBodies = cfg.LogBodies
+	}
+	if r.adcm != nil {
+		r.adcm.SetLogBodies(cfg.LogBodies)
 	}
 }
 
