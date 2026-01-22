@@ -19,6 +19,7 @@ type Rules struct {
 }
 
 type RuleSystemd struct {
+	Name       string   `json:"name"       yaml:"name"`
 	Unit       string   `json:"unit"       yaml:"unit"`
 	UnitGlob   string   `json:"unit_glob"  yaml:"unit_glob"`
 	Components []string `json:"components" yaml:"components"`

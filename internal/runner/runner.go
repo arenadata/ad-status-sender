@@ -1,25 +1,29 @@
 package runner
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
+	"database/sql"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/arenadata/ad-status-sender/internal/adcmclient"
 	"github.com/arenadata/ad-status-sender/internal/check"
 	"github.com/arenadata/ad-status-sender/internal/config"
 	"github.com/arenadata/ad-status-sender/internal/rules"
+	"github.com/arenadata/ad-status-sender/internal/storage/sqlite"
+	"github.com/fsnotify/fsnotify"
 )
 
 const (
@@ -28,83 +32,16 @@ const (
 	httpMaxIdlePerHost = 100
 	httpIdleTimeout    = 90 * time.Second
 
-	defaultInterval    = 5 * time.Second
-	defaultHTTPTimeout = 5 * time.Second
-	defaultForceSend   = 120 * time.Second
+	defaultInterval     = 5 * time.Second
+	defaultHTTPTimeout  = 5 * time.Second
+	defaultForceSend    = 120 * time.Second
+	defaultRulesRefresh = 60 * time.Second
+	legacyDebounceDelay = 150 * time.Millisecond
+
+	rulesSourceYAML   = "yaml"
+	rulesSourceLegacy = "legacy"
+	rulesSourceADCM   = "adcm"
 )
-
-type httpPoster struct {
-	log       *slog.Logger
-	c         *http.Client
-	adcmURL   string
-	hostID    int
-	token     string
-	logBodies bool
-}
-
-func (p *httpPoster) PostHost(ctx context.Context, status int) error {
-	url := fmt.Sprintf("%s/status/api/v1/host/%d/", strings.TrimRight(p.adcmURL, "/"), p.hostID)
-	payload := map[string]int{"status": status}
-	body, _ := json.Marshal(payload)
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Token "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.c.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if p.logBodies || resp.StatusCode >= http.StatusMultipleChoices {
-		data, _ := io.ReadAll(resp.Body)
-		p.log.InfoContext(
-			ctx,
-			"host post",
-			"url", url,
-			"code", resp.StatusCode,
-			"sent_status", status,
-			"body", strings.TrimSpace(string(data)),
-		)
-	}
-	return nil
-}
-
-func (p *httpPoster) PostComponent(ctx context.Context, compID string, status int) error {
-	url := fmt.Sprintf(
-		"%s/status/api/v1/host/%d/component/%s/",
-		strings.TrimRight(p.adcmURL, "/"),
-		p.hostID,
-		compID,
-	)
-	payload := map[string]int{"status": status}
-	body, _ := json.Marshal(payload)
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Token "+p.token)
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := p.c.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if p.logBodies || resp.StatusCode >= http.StatusMultipleChoices {
-		data, _ := io.ReadAll(resp.Body)
-		p.log.InfoContext(
-			ctx,
-			"status post",
-			"url", url,
-			"comp", compID,
-			"code", resp.StatusCode,
-			"sent_status", status,
-			"body", strings.TrimSpace(string(data)),
-		)
-	}
-	return nil
-}
 
 type Runner struct {
 	cfgPath string
@@ -112,16 +49,19 @@ type Runner struct {
 
 	mu     sync.RWMutex
 	cfg    config.Config
-	token  string
 	client *http.Client
+	db     *sqlite.Store
+	dbPath string
+	adcm   *adcmclient.Client
 
 	ruleStore rules.Store
 	stopWatch chan struct{}
 
-	tickerMu sync.Mutex
-	ticker   Ticker
-	jobs     chan func()
-	cancel   context.CancelFunc
+	tickerMu    sync.Mutex
+	ticker      Ticker
+	jobs        chan func()
+	cancel      context.CancelFunc
+	rulesSyncMu sync.Mutex
 
 	sd   check.Systemd
 	dck  check.Docker
@@ -175,7 +115,7 @@ func (r *Runner) Start() error {
 	if err := r.reload(); err != nil {
 		return err
 	}
-	if err := r.loadRulesOnce(); err != nil {
+	if err := r.syncRules(context.Background()); err != nil {
 		r.log.Warn("rules initial load", "err", err)
 	}
 
@@ -186,6 +126,8 @@ func (r *Runner) Start() error {
 	r.startWorkers(ctx)
 	r.startTickerLoop(ctx)
 	r.startRulesWatcher()
+	r.startRulesSyncer(ctx)
+	r.startLegacyWatcher(ctx)
 	r.startSignalHandler()
 
 	return nil
@@ -195,6 +137,7 @@ func (r *Runner) Stop() {
 	if r.cancel != nil {
 		r.cancel()
 	}
+	r.closeStopWatch()
 }
 
 func (r *Runner) initRuntime() {
@@ -229,14 +172,156 @@ func (r *Runner) startTickerLoop(ctx context.Context) {
 func (r *Runner) startRulesWatcher() {
 	r.stopWatch = make(chan struct{})
 	go func() {
+		r.mu.RLock()
+		src := r.cfg.RulesSource
+		r.mu.RUnlock()
+		if src != rulesSourceYAML {
+			return
+		}
 		err := rules.Watch(r.stopWatch, r.cfg.RulesPath, func(rr rules.Rules) {
-			r.ruleStore.Set(rr)
+			if syncErr := r.syncRulesWithImporter(context.Background(), yamlRulesImporter{rr: rr}); syncErr != nil {
+				r.log.Error("rules import", "err", syncErr)
+				return
+			}
 			r.log.Info("rules reloaded", "systemd", len(rr.Systemd), "docker", len(rr.Docker))
 		})
 		if err != nil {
 			r.log.Error("rules watch", "err", err)
 		}
 	}()
+}
+
+func (r *Runner) startRulesSyncer(ctx context.Context) {
+	go func() {
+		for {
+			r.mu.RLock()
+			src := r.cfg.RulesSource
+			interval := config.MustDuration(r.cfg.RulesRefresh, defaultRulesRefresh)
+			r.mu.RUnlock()
+
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			timer.Stop()
+
+			if src == rulesSourceYAML || src == rulesSourceLegacy {
+				continue
+			}
+			if err := r.syncRules(context.Background()); err != nil {
+				r.log.Error("rules sync", "err", err)
+			}
+		}
+	}()
+}
+
+func (r *Runner) startLegacyWatcher(ctx context.Context) {
+	go func() {
+		if err := r.runLegacyWatcher(ctx); err != nil {
+			r.log.Error("legacy watch", "err", err)
+		}
+	}()
+}
+
+type legacyPaths struct {
+	root     string
+	services string
+	docker   string
+	hosts    string
+}
+
+func (r *Runner) legacyConfig() (string, string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.cfg.RulesSource, r.cfg.LegacyDir
+}
+
+func (r *Runner) runLegacyWatcher(ctx context.Context) error {
+	src, legacyDir := r.legacyConfig()
+	if src != rulesSourceLegacy {
+		return nil
+	}
+	if strings.TrimSpace(legacyDir) == "" {
+		return errors.New("legacy_dir is empty")
+	}
+	w, paths, err := r.newLegacyWatcher(legacyDir)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+	r.legacyWatchLoop(ctx, w, paths)
+	return nil
+}
+
+func (r *Runner) newLegacyWatcher(legacyDir string) (*fsnotify.Watcher, legacyPaths, error) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, legacyPaths{}, err
+	}
+	paths := legacyPaths{
+		root:     legacyDir,
+		services: filepath.Join(legacyDir, "services"),
+		docker:   filepath.Join(legacyDir, "docker"),
+		hosts:    filepath.Join(legacyDir, "hosts"),
+	}
+	r.addLegacyWatch(w, paths.root)
+	r.addLegacyWatch(w, paths.services)
+	r.addLegacyWatch(w, paths.docker)
+	r.addLegacyWatch(w, paths.hosts)
+	return w, paths, nil
+}
+
+func (r *Runner) addLegacyWatch(w *fsnotify.Watcher, path string) {
+	if st, stErr := os.Stat(path); stErr == nil && st.IsDir() {
+		if addErr := w.Add(path); addErr != nil {
+			r.log.Warn("legacy watch add failed", "path", path, "err", addErr)
+		}
+	}
+}
+
+func (r *Runner) legacyWatchLoop(ctx context.Context, w *fsnotify.Watcher, paths legacyPaths) {
+	debounce := time.NewTimer(0)
+	if !debounce.Stop() {
+		<-debounce.C
+	}
+	fire := func() { debounce.Reset(legacyDebounceDelay) }
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev := <-w.Events:
+			if r.legacyEventTriggersSync(w, paths, ev) {
+				fire()
+			}
+		case <-debounce.C:
+			if syncErr := r.syncRules(context.Background()); syncErr != nil {
+				r.log.ErrorContext(ctx, "legacy rules sync", "err", syncErr)
+			}
+		case werr := <-w.Errors:
+			r.log.WarnContext(ctx, "legacy watch error", "err", werr)
+		}
+	}
+}
+
+func (r *Runner) legacyEventTriggersSync(w *fsnotify.Watcher, paths legacyPaths, ev fsnotify.Event) bool {
+	if ev.Has(fsnotify.Create) {
+		if st, stErr := os.Stat(ev.Name); stErr == nil && st.IsDir() {
+			_ = w.Add(ev.Name)
+		}
+	}
+	if !isLegacyWriteEvent(ev) {
+		return false
+	}
+	return isUnder(paths.services, ev.Name) || isUnder(paths.docker, ev.Name) || isUnder(paths.hosts, ev.Name)
+}
+
+func isLegacyWriteEvent(ev fsnotify.Event) bool {
+	return ev.Has(fsnotify.Write) || ev.Has(fsnotify.Create) ||
+		ev.Has(fsnotify.Remove) || ev.Has(fsnotify.Rename)
 }
 
 func (r *Runner) startSignalHandler() {
@@ -250,28 +335,105 @@ func (r *Runner) startSignalHandler() {
 				if err := r.reload(); err != nil {
 					r.log.Error("reload config", "err", err)
 				}
-				if err := r.loadRulesOnce(); err != nil {
+				if err := r.syncRules(context.Background()); err != nil {
 					r.log.Error("reload rules", "err", err)
 				}
 			default:
 				r.Stop()
-				close(r.stopWatch)
 				return
 			}
 		}
 	}()
 }
 
-func (r *Runner) reload() error {
-	c, loadErr := config.Load(r.cfgPath)
-	if loadErr != nil {
-		return loadErr
+func (r *Runner) closeStopWatch() {
+	r.mu.Lock()
+	ch := r.stopWatch
+	r.stopWatch = nil
+	r.mu.Unlock()
+	if ch == nil {
+		return
 	}
-	tok, tokenErr := config.LoadToken(&c)
-	if tokenErr != nil {
-		return tokenErr
+	defer func() {
+		_ = recover()
+	}()
+	close(ch)
+}
+
+type authConfig struct {
+	cfg     config.Config
+	token   string
+	user    string
+	pass    string
+	credErr error
+}
+
+func (r *Runner) reload() error {
+	auth, err := loadAuthConfig(r.cfgPath)
+	if err != nil {
+		return err
 	}
 
+	r.initCheckers()
+
+	httpc := makeHTTPClient(auth.cfg)
+	tok, err := r.ensureToken(auth, httpc)
+	if err != nil {
+		return err
+	}
+	r.adcm = r.buildADCMClient(auth, tok, httpc)
+	r.adcm.SetLogBodies(auth.cfg.LogBodies)
+
+	r.updatePoster(auth.cfg)
+
+	if openErr := r.openDB(auth.cfg.RulesDB); openErr != nil {
+		return openErr
+	}
+
+	r.mu.Lock()
+	r.cfg = auth.cfg
+	r.client = httpc
+	r.forceAfter = config.MustDuration(auth.cfg.ForceSendAfter, defaultForceSend)
+	r.mu.Unlock()
+
+	r.resetTicker(config.MustDuration(auth.cfg.Interval, defaultInterval))
+	return nil
+}
+
+func loadAuthConfig(path string) (authConfig, error) {
+	cfg, loadErr := config.Load(path)
+	if loadErr != nil {
+		return authConfig{}, loadErr
+	}
+	if cfg.HostID == 0 && cfg.RulesSource == rulesSourceLegacy {
+		hostIDs, err := legacyHostIDs(filepath.Join(cfg.LegacyDir, "hosts"))
+		if err != nil {
+			return authConfig{}, err
+		}
+		switch len(hostIDs) {
+		case 0:
+			return authConfig{}, errors.New("host_id is required or legacy/hosts is empty")
+		case 1:
+			cfg.HostID = hostIDs[0]
+		default:
+			return authConfig{}, errors.New("multiple host_id entries in legacy/hosts")
+		}
+	}
+	tok, tokenErr := config.LoadToken(&cfg)
+	user, pass, credErr := config.LoadUserPass(&cfg)
+	if tokenErr != nil && credErr != nil {
+		return authConfig{}, tokenErr
+	}
+	return authConfig{
+		cfg:     cfg,
+		token:   tok,
+		user:    user,
+		pass:    pass,
+		credErr: credErr,
+	}, nil
+}
+
+func (r *Runner) initCheckers() {
 	if r.dck == nil {
 		if d, err := check.NewDockerChecker(); err == nil {
 			r.dck = d
@@ -286,35 +448,78 @@ func (r *Runner) reload() error {
 			r.log.Warn("systemd dbus init failed", "err", err)
 		}
 	}
+}
 
-	httpc := makeHTTPClient(c)
-
-	if r.post == nil {
-		r.post = &httpPoster{
-			log:       r.log,
-			c:         httpc,
-			adcmURL:   c.ADCMURL,
-			hostID:    c.HostID,
-			token:     tok,
-			logBodies: c.LogBodies,
-		}
-	} else if hp, ok := r.post.(*httpPoster); ok {
-		hp.c = httpc
-		hp.adcmURL = c.ADCMURL
-		hp.hostID = c.HostID
-		hp.token = tok
-		hp.logBodies = c.LogBodies
+func (r *Runner) ensureToken(auth authConfig, httpc *http.Client) (string, error) {
+	tok := strings.TrimSpace(auth.token)
+	if tok != "" {
+		return tok, nil
 	}
+	if auth.credErr != nil {
+		return "", auth.credErr
+	}
+	tmp := adcmclient.New(auth.cfg.ADCMURL, "", httpc, r.log)
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		config.MustDuration(auth.cfg.HTTPTimeout, defaultHTTPTimeout),
+	)
+	defer cancel()
+	return tmp.ObtainToken(ctx, auth.user, auth.pass)
+}
 
-	r.mu.Lock()
-	r.cfg = c
-	r.token = tok
-	r.client = httpc
-	r.forceAfter = config.MustDuration(c.ForceSendAfter, defaultForceSend)
-	r.mu.Unlock()
+func (r *Runner) buildADCMClient(auth authConfig, token string, httpc *http.Client) *adcmclient.Client {
+	var client *adcmclient.Client
+	lastToken := strings.TrimSpace(token)
+	tokenProvider := func(ctx context.Context) (string, error) {
+		tok2, _ := config.LoadToken(&auth.cfg)
+		tok2 = strings.TrimSpace(tok2)
+		if tok2 != "" && tok2 != lastToken {
+			lastToken = tok2
+			return tok2, nil
+		}
+		if auth.credErr != nil {
+			if tok2 != "" {
+				lastToken = tok2
+				return tok2, nil
+			}
+			return "", auth.credErr
+		}
+		if client == nil {
+			return "", errors.New("adcm client not initialized")
+		}
+		newTok, err := client.ObtainToken(ctx, auth.user, auth.pass)
+		if err == nil {
+			lastToken = strings.TrimSpace(newTok)
+			return lastToken, nil
+		}
+		if tok2 != "" {
+			lastToken = tok2
+			return tok2, nil
+		}
+		return "", err
+	}
+	client = adcmclient.NewWithTokenProvider(auth.cfg.ADCMURL, token, tokenProvider, httpc, r.log)
+	return client
+}
 
-	r.resetTicker(config.MustDuration(c.Interval, defaultInterval))
-	return nil
+func (r *Runner) updatePoster(cfg config.Config) {
+	if r.post == nil {
+		r.post = &adcmPoster{
+			log:       r.log,
+			client:    r.adcm,
+			hostID:    cfg.HostID,
+			logBodies: cfg.LogBodies,
+		}
+		return
+	}
+	if ap, ok := r.post.(*adcmPoster); ok {
+		ap.client = r.adcm
+		ap.hostID = cfg.HostID
+		ap.logBodies = cfg.LogBodies
+	}
+	if r.adcm != nil {
+		r.adcm.SetLogBodies(cfg.LogBodies)
+	}
 }
 
 func makeHTTPClient(c config.Config) *http.Client {
@@ -363,8 +568,76 @@ func buildTLSConfig(c config.Config) *tls.Config {
 	return tlsConf
 }
 
-func (r *Runner) loadRulesOnce() error {
-	rr, err := rules.Load(r.cfg.RulesPath)
+func (r *Runner) openDB(path string) error {
+	dsn := rulesDBDSN(path)
+	if r.db != nil && r.dbPath == dsn {
+		return nil
+	}
+	if r.db != nil {
+		_ = r.db.Close()
+	}
+	store, err := sqlite.Open(dsn)
+	if err != nil {
+		return err
+	}
+	r.db = store
+	r.dbPath = dsn
+	return nil
+}
+
+func rulesDBDSN(path string) string {
+	if strings.HasPrefix(path, "file:") {
+		return path
+	}
+	return "file:" + filepath.Clean(path)
+}
+
+func (r *Runner) syncRules(ctx context.Context) error {
+	imp, err := r.selectImporter()
+	if err != nil {
+		return err
+	}
+	return r.syncRulesWithImporter(ctx, imp)
+}
+
+func (r *Runner) syncRulesWithImporter(ctx context.Context, imp rulesImporter) error {
+	r.rulesSyncMu.Lock()
+	defer r.rulesSyncMu.Unlock()
+	if r.db == nil {
+		return errors.New("rules db not initialized")
+	}
+	if imp == nil {
+		return errors.New("rules importer is nil")
+	}
+	if updErr := r.db.UpdateRules(ctx, func(tx *sql.Tx) error {
+		if clearErr := sqlite.ClearRulesTx(ctx, tx); clearErr != nil {
+			return clearErr
+		}
+		return imp.Import(ctx, tx)
+	}); updErr != nil {
+		return updErr
+	}
+	return r.loadRulesOnce(ctx)
+}
+
+func (r *Runner) selectImporter() (rulesImporter, error) {
+	switch r.cfg.RulesSource {
+	case rulesSourceYAML:
+		return yamlFileImporter{path: r.cfg.RulesPath}, nil
+	case rulesSourceLegacy:
+		return legacyImporter{legacyDir: r.cfg.LegacyDir, hostID: r.cfg.HostID}, nil
+	case rulesSourceADCM:
+		return adcmImporter{client: r.adcm, hostID: r.cfg.HostID}, nil
+	default:
+		return nil, fmt.Errorf("unsupported rules_source %q", r.cfg.RulesSource)
+	}
+}
+
+func (r *Runner) loadRulesOnce(ctx context.Context) error {
+	if r.db == nil {
+		return errors.New("rules db not initialized")
+	}
+	rr, err := r.db.LoadRulesForHost(ctx, r.cfg.HostID)
 	if err != nil {
 		return err
 	}
@@ -401,17 +674,16 @@ func (r *Runner) loop(ctx context.Context) {
 }
 
 func (r *Runner) scanOnce(ctx context.Context) {
-	cfg, token, force := r.snapshot()
-	_ = token
+	cfg, force := r.snapshot()
 	r.scanSystemd(ctx, cfg, force)
 	r.scanDocker(ctx, cfg, force)
 	r.sendHeartbeat(ctx, cfg, force)
 }
 
-func (r *Runner) snapshot() (config.Config, string, time.Duration) {
+func (r *Runner) snapshot() (config.Config, time.Duration) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.cfg, r.token, r.forceAfter
+	return r.cfg, r.forceAfter
 }
 
 func (r *Runner) scanSystemd(ctx context.Context, cfg config.Config, forceAfter time.Duration) {
@@ -528,4 +800,37 @@ func (r *Runner) markSent(key string, status int) {
 	r.cacheMu.Lock()
 	r.cache[key] = lastSend{status: status, lastTime: r.clk.Now()}
 	r.cacheMu.Unlock()
+}
+
+func legacyHostIDs(dir string) ([]int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []int
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		id, convErr := strconv.Atoi(e.Name())
+		if convErr != nil {
+			return nil, fmt.Errorf("invalid host id %q in %s", e.Name(), dir)
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+func isUnder(parent, path string) bool {
+	if parent == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(parent, path)
+	if err != nil {
+		return false
+	}
+	return rel != "." && !strings.HasPrefix(rel, "..")
 }

@@ -64,10 +64,39 @@ func TestLoadToken_Priority(t *testing.T) {
 	}
 }
 
+func TestLoadUserPass_Priority(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "adcm_user"), []byte("cred_user\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "adcm_password"), []byte("cred_pass\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// config has priority
+	c := &Config{
+		ADCMUser: "cfg_user",
+		ADCMPass: "cfg_pass",
+	}
+	user, pass, err := LoadUserPass(c)
+	if err != nil || user != "cfg_user" || pass != "cfg_pass" {
+		t.Fatalf("config creds failed: user=%q pass=%q err=%v", user, pass, err)
+	}
+
+	// systemd credentials
+	t.Setenv("CREDENTIALS_DIRECTORY", dir)
+	c = &Config{}
+	user, pass, err = LoadUserPass(c)
+	if err != nil || user != "cred_user" || pass != "cred_pass" {
+		t.Fatalf("systemd creds failed: user=%q pass=%q err=%v", user, pass, err)
+	}
+}
+
 func TestLoad_Validate(t *testing.T) {
 	yml := []byte(`
 adcm_url: "http://localhost"
 host_id:  42
+rules_db: "/tmp/rules.db"
 rules_path: "/tmp/x.yaml"
 `)
 	fn := filepath.Join(t.TempDir(), "cfg.yaml")
@@ -78,7 +107,23 @@ rules_path: "/tmp/x.yaml"
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
-	if cfg.HostID != 42 || cfg.ADCMURL == "" || cfg.RulesPath == "" {
+	if cfg.HostID != 42 || cfg.ADCMURL == "" || cfg.RulesPath == "" || cfg.RulesDB == "" {
 		t.Fatalf("bad values: %+v", cfg)
+	}
+}
+
+func TestLoad_LegacyAllowsMissingHostID(t *testing.T) {
+	yml := []byte(`
+adcm_url: "http://localhost"
+rules_source: "legacy"
+rules_db: "/tmp/rules.db"
+legacy_dir: "/tmp/legacy"
+`)
+	fn := filepath.Join(t.TempDir(), "cfg.yaml")
+	if err := os.WriteFile(fn, yml, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(fn); err != nil {
+		t.Fatalf("load failed: %v", err)
 	}
 }

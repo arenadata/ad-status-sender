@@ -7,14 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/arenadata/ad-status-sender/internal/config"
+	"github.com/arenadata/ad-status-sender/internal/adcmclient"
 )
 
-func TestHTTPPoster_HostAndComponent(t *testing.T) {
+func TestADCMPPoster_HostAndComponent(t *testing.T) {
 	var cnt int32
 	var lastURL, lastAuth, lastBody string
 
@@ -29,19 +28,12 @@ func TestHTTPPoster_HostAndComponent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := config.Config{
-		ADCMURL: "http://" + strings.TrimPrefix(srv.URL, "http://"),
-		HostID:  7,
-	}
-	httpc := makeHTTPClient(cfg)
-
-	p := &httpPoster{
-		log:       slog.Default(),
-		c:         httpc,
-		adcmURL:   cfg.ADCMURL,
-		hostID:    cfg.HostID,
-		token:     "TokenX",
-		logBodies: true,
+	httpc := srv.Client()
+	client := adcmclient.New(srv.URL, "TokenX", httpc, slog.Default())
+	p := &adcmPoster{
+		log:    slog.Default(),
+		client: client,
+		hostID: 7,
 	}
 
 	if err := p.PostHost(context.Background(), 0); err != nil {
@@ -55,8 +47,13 @@ func TestHTTPPoster_HostAndComponent(t *testing.T) {
 		t.Fatalf("bad host body: %s err=%v", lastBody, err)
 	}
 
-	p.token = "ZZ"
-	if err := p.PostComponent(context.Background(), "42", 1); err != nil {
+	client2 := adcmclient.New(srv.URL, "ZZ", httpc, slog.Default())
+	p2 := &adcmPoster{
+		log:    slog.Default(),
+		client: client2,
+		hostID: 7,
+	}
+	if err := p2.PostComponent(context.Background(), "42", 1); err != nil {
 		t.Fatalf("PostComponent err: %v", err)
 	}
 	if lastURL != "/status/api/v1/host/7/component/42/" || lastAuth != "Token ZZ" {

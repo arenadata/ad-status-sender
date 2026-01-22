@@ -2,7 +2,15 @@ adcm_url: "https://adcm.example.com"
 host_id: 101
 
 token_file: "/etc/secure/adcm.token"
+# adcm_user: "admin"        # use with adcm_password instead of token
+# adcm_password: "secret"
+
+# rules source: yaml | legacy | adcm
+rules_source: "yaml"
 rules_path: "/etc/ad-status-sender/conf/rules.yaml"
+rules_db: "/var/lib/ad-status-sender/rules.db"
+# legacy_dir: "/usr/lib/adcm-status-checker"
+# rules_refresh_interval: "60s"  # for rules_source: legacy | adcm
 
 interval: "5s"
 http_timeout: "5s"

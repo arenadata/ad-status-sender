@@ -6,8 +6,11 @@ A lightweight Go agent that runs **on every host**, collects local statuses (sys
 
 ## Features
 
-- Single `config.yaml` + single `rules.yaml`.
-- **Hot reload** of rules via `fsnotify` (no restart or signals).
+- SQLite-backed rules database with multiple sources: `rules.yaml`, `configs/legacy`, or ADCM.
+- **Hot reload** of rules:
+  - `yaml`: `fsnotify` on `rules.yaml`
+  - `legacy`: `fsnotify` on `legacy_dir` (services/docker/hosts)
+  - `adcm`: periodic refresh (`rules_refresh_interval`)
 - **Hot reload** of config on **SIGHUP**.
 - **Status cache** + **forced re-send** at configurable interval (`force_send_after`, default **120s**) so the ADCM doesn’t mark entities as stale.
 - **TLS/HTTPS**: custom CA, mTLS (client cert/key), `server_name` override, `insecure_skip_verify`.
@@ -40,9 +43,21 @@ host_id: 101
 
 # token (prefer file or systemd-credentials)
 token_file: "/etc/secure/adcm.token"
+# adcm_user: "admin"        # use with adcm_password instead of token
+# adcm_password: "secret"
 
-# path to rules (auto hot-reload)
+# rules source: yaml | legacy | adcm
+rules_source: "yaml"
+
+# sqlite database (rules source of truth)
+rules_db: "/var/lib/ad-status-sender/rules.db"
+
+# path to rules (auto hot-reload, only for rules_source: yaml)
 rules_path: "/etc/ad-status-sender/rules.yaml"
+
+# legacy_dir: "/usr/lib/adcm-status-checker"   # only for rules_source: legacy
+
+# rules_refresh_interval: "60s"               # only for rules_source: adcm
 
 # intervals & timeouts
 interval: "5s"            # how often to probe local system
@@ -63,6 +78,78 @@ tls:
   server_name: "adcm.internal"                                # optional (SNI/verify override)
   insecure_skip_verify: false                                 
 ```
+
+### Example: legacy source
+
+```yaml
+adcm_url: "https://adcm.example.com"
+host_id: 7
+adcm_user: "admin"
+adcm_password: "secret"
+
+rules_source: "legacy"
+legacy_dir: "/usr/lib/adcm-status-checker"
+rules_db: "/var/lib/ad-status-sender/rules.db"
+```
+
+Legacy directory layout:
+
+```
+/usr/lib/adcm-status-checker/
+  services/
+    nginx.service          # contains component_id list
+    hbase-regionserver.service
+  docker/
+    core                   # components + names/labels
+  hosts/
+    7                      # optional scope (filenames are host IDs)
+```
+
+Example contents:
+
+`services/nginx.service`
+```
+501
+502
+```
+
+`docker/core` (format A: two blocks with empty line separator)
+```
+601
+602
+
+db
+cache
+role=frontend
+```
+
+`docker/adcc` (format B: first line components, remaining lines selectors)
+```
+4
+adcc_ui
+adcc_backend
+```
+
+### Example: adcm source
+
+```yaml
+adcm_url: "https://adcm.example.com"
+host_id: 7
+adcm_user: "admin"
+adcm_password: "secret"
+
+rules_source: "adcm"
+rules_refresh_interval: "60s"
+rules_db: "/var/lib/ad-status-sender/rules.db"
+```
+
+### ADCM login/password
+
+You can use `adcm_user` + `adcm_password` instead of a token. The agent will obtain a token on startup (if no token is provided) and refresh it on 401 responses.
+
+Systemd credentials are also supported:
+- `CREDENTIALS_DIRECTORY/adcm_user`
+- `CREDENTIALS_DIRECTORY/adcm_password`
 
 > You can put the token directly in YAML (`token:`), but **using `token_file` or systemd credentials is recommended**.
 
@@ -116,6 +203,31 @@ This prevents the receiver from marking entities stale when nothing changes.
 
 ---
 
+## Rules sources
+
+### 1) rules.yaml
+Parsed into SQLite. Hot-reloaded on file change.
+
+### 2) configs/legacy
+Directory structure:
+```
+legacy/
+  services/   # filename = unit, content = component_id list
+  docker/     # component_id list + names/labels
+  hosts/      # optional host scope (filenames are host IDs)
+```
+Changes in these folders trigger a sync into SQLite.
+
+### 3) ADCM
+Rules are built from ADCM service configs:
+- for each component of the current host, the service config is inspected for
+  `components.<component>.systemd.service_name`
+- this becomes a systemd rule (`<service_name>.service` if missing suffix)
+
+Refresh happens on a timer (`rules_refresh_interval`).
+
+---
+
 ## How it works
 
 Each `interval`:
@@ -124,7 +236,9 @@ Each `interval`:
 3) Sends host heartbeat.
 
 **Hot reload**:
-- `rules.yaml` is automatically reloaded via `fsnotify`.
+- `rules.yaml` is reloaded via `fsnotify` when `rules_source: yaml`.
+- `legacy_dir` is reloaded via `fsnotify` when `rules_source: legacy`.
+- `rules_source: adcm` is refreshed by timer.
 - `config.yaml` is reloaded on **SIGHUP** (e.g., `systemctl reload ad-status-sender`).
 
 HTTP client:

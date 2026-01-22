@@ -25,7 +25,13 @@ type Config struct {
 	HostID         int    `yaml:"host_id"`
 	Token          string `yaml:"token"`
 	TokenFile      string `yaml:"token_file"`
+	ADCMUser       string `yaml:"adcm_user"`
+	ADCMPass       string `yaml:"adcm_password"`
+	RulesSource    string `yaml:"rules_source"` // "yaml" | "legacy" | "adcm"
 	RulesPath      string `yaml:"rules_path"`
+	RulesDB        string `yaml:"rules_db"`
+	LegacyDir      string `yaml:"legacy_dir"`
+	RulesRefresh   string `yaml:"rules_refresh_interval"`
 	Interval       string `yaml:"interval"`
 	HTTPTimeout    string `yaml:"http_timeout"`
 	Concurrency    int    `yaml:"concurrency"`
@@ -56,8 +62,29 @@ func Load(path string) (Config, error) {
 	if unErr := yaml.Unmarshal(data, &c); unErr != nil {
 		return Config{}, unErr
 	}
-	if c.ADCMURL == "" || c.HostID == 0 || c.RulesPath == "" {
-		return Config{}, errors.New("adcm_url, host_id, rules_path are required")
+	c.RulesSource = strings.ToLower(strings.TrimSpace(c.RulesSource))
+	if c.RulesSource == "" {
+		c.RulesSource = "yaml"
+	}
+	if c.ADCMURL == "" || c.RulesDB == "" {
+		return Config{}, errors.New("adcm_url and rules_db are required")
+	}
+	if c.HostID == 0 && c.RulesSource != "legacy" {
+		return Config{}, errors.New("host_id is required for non-legacy rules_source")
+	}
+	switch c.RulesSource {
+	case "yaml":
+		if c.RulesPath == "" {
+			return Config{}, errors.New("rules_path is required for rules_source: yaml")
+		}
+	case "legacy":
+		if c.LegacyDir == "" {
+			return Config{}, errors.New("legacy_dir is required for rules_source: legacy")
+		}
+	case "adcm":
+		// no extra fields required
+	default:
+		return Config{}, errors.New("rules_source must be one of: yaml, legacy, adcm")
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = runtime.NumCPU()
@@ -82,6 +109,30 @@ func LoadToken(c *Config) (string, error) {
 		return strings.TrimSpace(string(b)), nil
 	}
 	return "", errors.New("no token provided")
+}
+
+func LoadUserPass(c *Config) (string, string, error) {
+	user := strings.TrimSpace(c.ADCMUser)
+	pass := strings.TrimSpace(c.ADCMPass)
+	if user != "" || pass != "" {
+		if user == "" || pass == "" {
+			return "", "", errors.New("adcm_user and adcm_password must be set together")
+		}
+		return user, pass, nil
+	}
+	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		u, uErr := os.ReadFile(filepath.Join(dir, "adcm_user"))
+		p, pErr := os.ReadFile(filepath.Join(dir, "adcm_password"))
+		if uErr == nil && pErr == nil {
+			user = strings.TrimSpace(string(u))
+			pass = strings.TrimSpace(string(p))
+			if user == "" || pass == "" {
+				return "", "", errors.New("adcm_user or adcm_password is empty")
+			}
+			return user, pass, nil
+		}
+	}
+	return "", "", errors.New("no adcm credentials provided")
 }
 
 func ParseSlogLevel(s string) slog.Level {
