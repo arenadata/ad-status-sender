@@ -211,8 +211,8 @@ func (r *Runner) startRulesSyncer(ctx context.Context) {
 			if src == rulesSourceYAML || src == rulesSourceLegacy {
 				continue
 			}
-			if err := r.syncRules(context.Background()); err != nil {
-				r.log.Error("rules sync", "err", err)
+			if err := r.syncRules(ctx); err != nil {
+				r.log.ErrorContext(ctx, "rules sync", "err", err)
 			}
 		}
 	}()
@@ -221,7 +221,7 @@ func (r *Runner) startRulesSyncer(ctx context.Context) {
 func (r *Runner) startLegacyWatcher(ctx context.Context) {
 	go func() {
 		if err := r.runLegacyWatcher(ctx); err != nil {
-			r.log.Error("legacy watch", "err", err)
+			r.log.ErrorContext(ctx, "legacy watch", "err", err)
 		}
 	}()
 }
