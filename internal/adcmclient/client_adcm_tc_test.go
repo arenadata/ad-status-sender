@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	adcmImageDefault = "arenadata/adcm:2.9.2"
+	adcmImageDefault = "arenadata/adcm:2.12.0"
 	adcmPort         = "8000/tcp"
 	pgImageDefault   = "postgres:14"
 	pgPort           = "5432/tcp"

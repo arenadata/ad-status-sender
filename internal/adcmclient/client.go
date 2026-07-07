@@ -22,6 +22,10 @@ type TokenProvider func(context.Context) (string, error)
 const (
 	defaultHTTPTimeout = 10 * time.Second
 	statusClassSuccess = 2
+
+	headerAccept      = "Accept"
+	headerContentType = "Content-Type"
+	mimeJSON          = "application/json"
 )
 
 type Client struct {
@@ -145,6 +149,7 @@ func (c *Client) doOnce(
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
+	//nolint:gosec // G704: url is built from operator-controlled config, not untrusted input
 	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return nil, err
@@ -155,7 +160,7 @@ func (c *Client) doOnce(
 	if withAuth && token != "" {
 		req.Header.Set("Authorization", "Token "+token)
 	}
-	return c.http.Do(req)
+	return c.http.Do(req) //nolint:gosec // G704: url from operator-controlled config
 }
 
 func (c *Client) doWithAuthRetry(
@@ -256,7 +261,7 @@ func (c *Client) listAllHosts(ctx context.Context) ([]HostObject, error) {
 }
 
 func (c *Client) fetchHostPage(ctx context.Context, fullURL string) ([]HostObject, string, error) {
-	headers := map[string]string{"Accept": "application/json"}
+	headers := map[string]string{headerAccept: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodGet, fullURL, nil, headers)
 	if err != nil {
 		return nil, "", err
@@ -308,7 +313,7 @@ func (c *Client) tryTokenEndpoint(ctx context.Context, path, user, pass string) 
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerContentType, mimeJSON)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return "", err
@@ -358,7 +363,7 @@ func (c *Client) FindHostID(ctx context.Context, fqdn string) (int, error) {
 
 func (c *Client) CreateHost(ctx context.Context, fqdn string) error {
 	body := []byte(fmt.Sprintf(`{"name":%q}`, fqdn))
-	headers := map[string]string{"Content-Type": "application/json"}
+	headers := map[string]string{headerContentType: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodPost, c.baseURL+"/api/v2/hosts/", body, headers)
 	if err != nil {
 		return err
@@ -397,7 +402,7 @@ func (c *Client) FirstComponentID(ctx context.Context, hostID int) (string, erro
 func (c *Client) PostHostStatus(ctx context.Context, hostID int, status int) error {
 	body := []byte(fmt.Sprintf(`{"status":%d}`, status))
 	url := fmt.Sprintf("%s/status/api/v1/host/%d/", strings.TrimRight(c.baseURL, "/"), hostID)
-	headers := map[string]string{"Content-Type": "application/json"}
+	headers := map[string]string{headerContentType: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodPost, url, body, headers)
 	if err != nil {
 		return err
@@ -427,7 +432,7 @@ func (c *Client) PostHostStatus(ctx context.Context, hostID int, status int) err
 func (c *Client) PostComponentStatus(ctx context.Context, hostID int, compID string, status int) error {
 	body := []byte(fmt.Sprintf(`{"status":%d}`, status))
 	url := fmt.Sprintf("%s/status/api/v1/host/%d/component/%s/", strings.TrimRight(c.baseURL, "/"), hostID, compID)
-	headers := map[string]string{"Content-Type": "application/json"}
+	headers := map[string]string{headerContentType: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodPost, url, body, headers)
 	if err != nil {
 		return err
@@ -487,7 +492,7 @@ func (c *Client) ListClusterServices(ctx context.Context, clusterID int) ([]Serv
 }
 
 func (c *Client) fetchServicePage(ctx context.Context, fullURL string) ([]ServiceObject, string, error) {
-	headers := map[string]string{"Accept": "application/json"}
+	headers := map[string]string{headerAccept: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodGet, fullURL, nil, headers)
 	if err != nil {
 		return nil, "", err
@@ -531,7 +536,7 @@ func (c *Client) CurrentServiceConfigID(ctx context.Context, clusterID, serviceI
 
 func (c *Client) listServiceConfigs(ctx context.Context, clusterID, serviceID int) ([]serviceConfigItem, error) {
 	url := fmt.Sprintf("%s/api/v2/clusters/%d/services/%d/configs/", c.baseURL, clusterID, serviceID)
-	headers := map[string]string{"Accept": "application/json"}
+	headers := map[string]string{headerAccept: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodGet, url, nil, headers)
 	if err != nil {
 		return nil, err
@@ -557,7 +562,7 @@ type ServiceConfig struct {
 
 func (c *Client) GetServiceConfig(ctx context.Context, clusterID, serviceID, configID int) (ServiceConfig, error) {
 	url := fmt.Sprintf("%s/api/v2/clusters/%d/services/%d/configs/%d/", c.baseURL, clusterID, serviceID, configID)
-	headers := map[string]string{"Accept": "application/json"}
+	headers := map[string]string{headerAccept: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodGet, url, nil, headers)
 	if err != nil {
 		return ServiceConfig{}, err

@@ -97,6 +97,7 @@ func LoadToken(c *Config) (string, error) {
 		return t, nil
 	}
 	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		//nolint:gosec // G703: literal filename under systemd CREDENTIALS_DIRECTORY, no traversal
 		if b, err := os.ReadFile(filepath.Join(dir, "adcm_token")); err == nil {
 			return strings.TrimSpace(string(b)), nil
 		}
@@ -121,7 +122,9 @@ func LoadUserPass(c *Config) (string, string, error) {
 		return user, pass, nil
 	}
 	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		//nolint:gosec // G703: literal filename under systemd CREDENTIALS_DIRECTORY
 		u, uErr := os.ReadFile(filepath.Join(dir, "adcm_user"))
+		//nolint:gosec // G703: literal filename under systemd CREDENTIALS_DIRECTORY
 		p, pErr := os.ReadFile(filepath.Join(dir, "adcm_password"))
 		if uErr == nil && pErr == nil {
 			user = strings.TrimSpace(string(u))
