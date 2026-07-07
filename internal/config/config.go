@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -89,7 +90,30 @@ func Load(path string) (Config, error) {
 	if c.Concurrency <= 0 {
 		c.Concurrency = runtime.NumCPU()
 	}
+	if err := validateDurations(&c); err != nil {
+		return Config{}, err
+	}
 	return c, nil
+}
+
+// validateDurations rejects malformed duration strings at load time so runtime
+// MustDuration calls (in the ticker loop, rules syncer and reload path) cannot panic.
+func validateDurations(c *Config) error {
+	fields := []struct{ name, val string }{
+		{"interval", c.Interval},
+		{"http_timeout", c.HTTPTimeout},
+		{"force_send_after", c.ForceSendAfter},
+		{"rules_refresh_interval", c.RulesRefresh},
+	}
+	for _, f := range fields {
+		if strings.TrimSpace(f.val) == "" {
+			continue
+		}
+		if _, err := time.ParseDuration(f.val); err != nil {
+			return fmt.Errorf("invalid %s %q: %w", f.name, f.val, err)
+		}
+	}
+	return nil
 }
 
 func LoadToken(c *Config) (string, error) {

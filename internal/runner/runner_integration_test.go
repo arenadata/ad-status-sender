@@ -13,11 +13,22 @@ import (
 	"github.com/arenadata/ad-status-sender/internal/rules"
 )
 
-type testClock struct{ now time.Time }
+type testClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
 
-func (c *testClock) Now() time.Time                   { return c.now }
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
 func (c *testClock) NewTicker(_ time.Duration) Ticker { return nil }
-func (c *testClock) advance(d time.Duration)          { c.now = c.now.Add(d) }
+func (c *testClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
 
 type sentEvent struct {
 	IsHost bool
@@ -78,9 +89,14 @@ func newLegacyRunner(t *testing.T, legacyDir string, hostID int) *Runner {
 		LegacyDir:   legacyDir,
 	}
 	r.mu.Unlock()
-	if err := r.openDB(rulesDB); err != nil {
+	db, dsn, err := r.reopenDB(rulesDB)
+	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	r.mu.Lock()
+	r.db = db
+	r.dbPath = dsn
+	r.mu.Unlock()
 	t.Cleanup(func() {
 		if r.db != nil {
 			_ = r.db.Close()

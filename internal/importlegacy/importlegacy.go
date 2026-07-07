@@ -16,6 +16,10 @@ import (
 	"github.com/arenadata/ad-status-sender/internal/storage/sqlite"
 )
 
+// legacyHostStatusMarker names the legacy services/ file that signals a host
+// heartbeat rather than a component.
+const legacyHostStatusMarker = "hoststatus"
+
 func ServicesDir(ctx context.Context, tx *sql.Tx, dir string, namePrefix string, hostIDs []int) error {
 	p := strings.TrimSpace(dir)
 	if p == "" {
@@ -31,6 +35,11 @@ func ServicesDir(ctx context.Context, tx *sql.Tx, dir string, namePrefix string,
 	}
 	for _, e := range entries {
 		if !isRegular(e) {
+			continue
+		}
+		// hoststatus is a host-heartbeat marker, not a component (see legacy
+		// adcm-status-checker.sh): importing it yields a phantom DOWN component.
+		if e.Name() == legacyHostStatusMarker {
 			continue
 		}
 		if err := importServiceFileTx(ctx, tx, filepath.Join(p, e.Name()), namePrefix, hostIDs); err != nil {
@@ -163,6 +172,9 @@ func readLines(path string) ([]string, error) {
 	return out, nil
 }
 
+// parseDockerFile reads the whole file (formats A/B), a deliberate superset of
+// the legacy selector's tail -1. Legacy docker files hold a single record, so the
+// results match; a multi-line file yields the union rather than the last line.
 func parseDockerFile(path string) ([]string, []string, []string, error) {
 	lines, rdErr := readAllLinesKeepEmpty(path)
 	if rdErr != nil {

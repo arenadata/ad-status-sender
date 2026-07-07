@@ -26,6 +26,12 @@ const (
 	headerAccept      = "Accept"
 	headerContentType = "Content-Type"
 	mimeJSON          = "application/json"
+
+	//nolint:gosec // G101: URL path, not a credential
+	statusCheckerTokenPath = "/api/v2/adcm/status-checker-token/"
+	// statusProbeCooldown throttles status-token endpoint retries after a failure
+	// (e.g. 404 on an ADCM image without the endpoint).
+	statusProbeCooldown = 60 * time.Second
 )
 
 type Client struct {
@@ -36,6 +42,14 @@ type Client struct {
 	http          *http.Client
 	log           *slog.Logger
 	logBodies     atomic.Bool
+
+	// Status POSTs use a shared secret, a different auth domain from the rbac token
+	// used for /api/v2/*. statusTokenProvider fetches it in rules_source=adcm;
+	// statusToken caches it. Unset/unavailable provider falls back to token.
+	statusToken         string
+	statusTokenProvider TokenProvider
+	statusProbeAfter    time.Time
+	statusFetchMu       sync.Mutex
 }
 
 func New(baseURL, token string, httpClient *http.Client, logger *slog.Logger) *Client {
@@ -133,6 +147,137 @@ func (c *Client) setToken(token string) {
 	c.tokenMu.Unlock()
 }
 
+// SetStatusTokenProvider sets the status-secret source. Call before sharing the client.
+func (c *Client) SetStatusTokenProvider(p TokenProvider) {
+	c.statusTokenProvider = p
+}
+
+func (c *Client) cachedStatusToken() string {
+	c.tokenMu.RLock()
+	defer c.tokenMu.RUnlock()
+	return c.statusToken
+}
+
+func (c *Client) setCachedStatusToken(token string) {
+	c.tokenMu.Lock()
+	c.statusToken = strings.TrimSpace(token)
+	c.statusProbeAfter = time.Time{}
+	c.tokenMu.Unlock()
+}
+
+func (c *Client) clearCachedStatusToken() {
+	c.tokenMu.Lock()
+	c.statusToken = ""
+	c.tokenMu.Unlock()
+}
+
+func (c *Client) startProbeCooldown() {
+	c.tokenMu.Lock()
+	c.statusProbeAfter = time.Now().Add(statusProbeCooldown)
+	c.tokenMu.Unlock()
+}
+
+// statusProviderReady: provider set and past any failure cooldown.
+func (c *Client) statusProviderReady() bool {
+	if c.statusTokenProvider == nil {
+		return false
+	}
+	c.tokenMu.RLock()
+	after := c.statusProbeAfter
+	c.tokenMu.RUnlock()
+	return !time.Now().Before(after)
+}
+
+// resolveStatusToken returns the status POST token: cached secret, a fresh fetch,
+// or token as fallback when no provider is set or the endpoint is unavailable.
+func (c *Client) resolveStatusToken(ctx context.Context) string {
+	if t := c.cachedStatusToken(); t != "" {
+		return t
+	}
+	if !c.statusProviderReady() {
+		return c.tokenValue()
+	}
+	c.statusFetchMu.Lock()
+	defer c.statusFetchMu.Unlock()
+	if t := c.cachedStatusToken(); t != "" {
+		return t
+	}
+	tok, err := c.statusTokenProvider(ctx)
+	if err != nil || strings.TrimSpace(tok) == "" {
+		c.log.WarnContext(ctx, "status token endpoint unavailable, using configured token", "err", err)
+		c.startProbeCooldown()
+		return c.tokenValue()
+	}
+	c.setCachedStatusToken(tok)
+	return strings.TrimSpace(tok)
+}
+
+// refetchStatusToken forces a fresh fetch after a 401 (rotated secret).
+func (c *Client) refetchStatusToken(ctx context.Context) (string, bool) {
+	c.statusFetchMu.Lock()
+	defer c.statusFetchMu.Unlock()
+	c.clearCachedStatusToken()
+	tok, err := c.statusTokenProvider(ctx)
+	if err != nil || strings.TrimSpace(tok) == "" {
+		c.startProbeCooldown()
+		return "", false
+	}
+	c.setCachedStatusToken(tok)
+	return strings.TrimSpace(tok), true
+}
+
+// ObtainStatusToken fetches the status secret from the ADCM status-checker-token
+// endpoint using the rbac token.
+func (c *Client) ObtainStatusToken(ctx context.Context) (string, error) {
+	headers := map[string]string{headerAccept: mimeJSON}
+	resp, err := c.doWithAuthRetry(ctx, http.MethodPost, c.baseURL+statusCheckerTokenPath, nil, headers)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != statusClassSuccess {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status checker token %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var body struct {
+		Token string `json:"token"`
+	}
+	if decodeErr := json.NewDecoder(resp.Body).Decode(&body); decodeErr != nil {
+		return "", decodeErr
+	}
+	if body.Token == "" {
+		return "", errors.New("status checker token response missing token")
+	}
+	return body.Token, nil
+}
+
+// doStatusPost posts to the status server with the status secret, refetching once on 401.
+func (c *Client) doStatusPost(
+	ctx context.Context,
+	url string,
+	body []byte,
+	headers map[string]string,
+) (*http.Response, error) {
+	tok := c.resolveStatusToken(ctx)
+	resp, err := c.doOnce(ctx, http.MethodPost, url, body, headers, tok)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusUnauthorized || c.statusTokenProvider == nil {
+		return resp, nil
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if ctx.Err() != nil {
+		return resp, nil //nolint:nilerr // ctx canceled: return the response, not a fetch error
+	}
+	tok2, ok := c.refetchStatusToken(ctx)
+	if !ok {
+		return c.doOnce(ctx, http.MethodPost, url, body, headers, c.tokenValue())
+	}
+	return c.doOnce(ctx, http.MethodPost, url, body, headers, tok2)
+}
+
 func (c *Client) SetLogBodies(enabled bool) {
 	c.logBodies.Store(enabled)
 }
@@ -143,13 +288,12 @@ func (c *Client) doOnce(
 	body []byte,
 	headers map[string]string,
 	token string,
-	withAuth bool,
 ) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	//nolint:gosec // G704: url is built from operator-controlled config, not untrusted input
+	//nolint:gosec // G704: url = operator config baseURL + fixed path + url.PathEscape'd segments
 	req, err := http.NewRequestWithContext(ctx, method, url, reader)
 	if err != nil {
 		return nil, err
@@ -157,10 +301,10 @@ func (c *Client) doOnce(
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	if withAuth && token != "" {
+	if token != "" {
 		req.Header.Set("Authorization", "Token "+token)
 	}
-	return c.http.Do(req) //nolint:gosec // G704: url from operator-controlled config
+	return c.http.Do(req) //nolint:gosec // G704: url = operator config baseURL + escaped path segments
 }
 
 func (c *Client) doWithAuthRetry(
@@ -170,7 +314,7 @@ func (c *Client) doWithAuthRetry(
 	headers map[string]string,
 ) (*http.Response, error) {
 	token := c.tokenValue()
-	resp, err := c.doOnce(ctx, method, url, body, headers, token, true)
+	resp, err := c.doOnce(ctx, method, url, body, headers, token)
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +340,7 @@ func (c *Client) doWithAuthRetry(
 		return nil, errors.New("token provider returned empty token")
 	}
 	c.setToken(newToken)
-	return c.doOnce(ctx, method, url, body, headers, newToken, true)
+	return c.doOnce(ctx, method, url, body, headers, newToken)
 }
 
 func (c *Client) GetClusterTopologyByHostName(ctx context.Context, fqdn string) (*HostTopology, error) {
@@ -285,14 +429,28 @@ func (c *Client) fetchHostPage(ctx context.Context, fullURL string) ([]HostObjec
 	next := ""
 	if body.Next != nil && *body.Next != "" {
 		u, parseErr := url.Parse(*body.Next)
-		if parseErr == nil && !u.IsAbs() {
+		switch {
+		case parseErr != nil:
+			c.log.WarnContext(ctx, "ignoring malformed pagination next", "next", *body.Next)
+		case !u.IsAbs():
 			next = c.baseURL + *body.Next
-		} else {
+		case c.sameOrigin(u):
 			next = *body.Next
+		default:
+			// Never follow a cross-origin next: it would leak the Authorization token.
+			c.log.WarnContext(ctx, "dropping cross-origin pagination next", "next", *body.Next)
 		}
 	}
 
 	return body.Results, next, nil
+}
+
+func (c *Client) sameOrigin(u *url.URL) bool {
+	base, err := url.Parse(c.baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, base.Scheme) && strings.EqualFold(u.Host, base.Host)
 }
 
 // ObtainToken posts to the ADCM token endpoint and returns a token.
@@ -308,8 +466,11 @@ func (c *Client) ObtainToken(ctx context.Context, user, pass string) (string, er
 }
 
 func (c *Client) tryTokenEndpoint(ctx context.Context, path, user, pass string) (string, error) {
-	body := strings.NewReader(fmt.Sprintf(`{"username":%q,"password":%q}`, user, pass))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, body)
+	payload, err := json.Marshal(map[string]string{"username": user, "password": pass})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
@@ -403,7 +564,7 @@ func (c *Client) PostHostStatus(ctx context.Context, hostID int, status int) err
 	body := []byte(fmt.Sprintf(`{"status":%d}`, status))
 	url := fmt.Sprintf("%s/status/api/v1/host/%d/", strings.TrimRight(c.baseURL, "/"), hostID)
 	headers := map[string]string{headerContentType: mimeJSON}
-	resp, err := c.doWithAuthRetry(ctx, http.MethodPost, url, body, headers)
+	resp, err := c.doStatusPost(ctx, url, body, headers)
 	if err != nil {
 		return err
 	}
@@ -431,9 +592,12 @@ func (c *Client) PostHostStatus(ctx context.Context, hostID int, status int) err
 
 func (c *Client) PostComponentStatus(ctx context.Context, hostID int, compID string, status int) error {
 	body := []byte(fmt.Sprintf(`{"status":%d}`, status))
-	url := fmt.Sprintf("%s/status/api/v1/host/%d/component/%s/", strings.TrimRight(c.baseURL, "/"), hostID, compID)
+	reqURL := fmt.Sprintf(
+		"%s/status/api/v1/host/%d/component/%s/",
+		strings.TrimRight(c.baseURL, "/"), hostID, url.PathEscape(compID),
+	)
 	headers := map[string]string{headerContentType: mimeJSON}
-	resp, err := c.doWithAuthRetry(ctx, http.MethodPost, url, body, headers)
+	resp, err := c.doStatusPost(ctx, reqURL, body, headers)
 	if err != nil {
 		return err
 	}
@@ -447,7 +611,7 @@ func (c *Client) PostComponentStatus(ctx context.Context, hostID int, compID str
 		c.log.InfoContext(
 			ctx,
 			"status post",
-			"url", url,
+			"url", reqURL,
 			"comp", compID,
 			"code", resp.StatusCode,
 			"sent_status", status,

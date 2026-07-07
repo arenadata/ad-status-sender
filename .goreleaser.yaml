@@ -27,7 +27,6 @@ archives:
       - goos: windows
         formats: [zip]
     files:
-      - scripts/**
       - configs/**
       - README.MD
 
@@ -59,9 +58,9 @@ nfpms:
 
       - src: ./configs/config.yaml
         dst: /etc/ad-status-sender/config.yaml
-        type: file
+        type: config|noreplace
         file_info:
-          mode: 0644
+          mode: 0640
 
       - dst: /usr/lib/ad-status-sender/bin
         type: dir
@@ -72,6 +71,11 @@ nfpms:
         type: dir
         file_info:
           mode: 0755
+
+      - dst: /var/lib/ad-status-sender
+        type: dir
+        file_info:
+          mode: 0750
 
     rpm:
       group: Development/Tools

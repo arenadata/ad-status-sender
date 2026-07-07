@@ -48,7 +48,9 @@ func (c *SystemdClient) SystemdStatus(ctx context.Context, unit string) int {
 		}
 		return UnexpectedExitCode
 	}
-	if st, ok := props["ActiveState"].(string); ok && st == "active" {
+	// reloading is a transient sub-state of active; legacy systemctl is-active
+	// treats it as up, so match that and avoid a spurious DOWN mid-reload.
+	if st, ok := props["ActiveState"].(string); ok && (st == "active" || st == "reloading") {
 		return 0
 	}
 	return 1

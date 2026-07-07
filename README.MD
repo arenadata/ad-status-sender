@@ -21,7 +21,7 @@ A lightweight Go agent that runs **on every host**, collects local statuses (sys
 
 ## Requirements
 
-- Go **≥ 1.24**
+- Go **≥ 1.26**
 - systemd **with D-Bus available** (for systemd checks)
 - Docker (for Docker checks)
 

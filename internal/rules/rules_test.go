@@ -56,7 +56,7 @@ func TestWatchHotReload(t *testing.T) {
 	go func() {
 		_ = Watch(stop, fn, func(Rules) {
 			atomic.AddInt32(&applied, 1)
-		})
+		}, nil)
 	}()
 
 	// give watcher time to init
