@@ -63,8 +63,8 @@ func addRow(
 	unitToTargets map[string][]rules.ComponentTarget,
 	log *slog.Logger,
 ) error {
-	compIDs := componentIDMap(comps)
-	unitToComps, err := collectSystemdRules(ctx, client, clusterID, compIDs, log)
+	hostComps := hostComponentSet(comps)
+	unitToComps, err := collectSystemdRules(ctx, client, clusterID, hostComps, log)
 	if err != nil {
 		return err
 	}
@@ -152,10 +152,10 @@ func fetchHost(ctx context.Context, client *adcmclient.Client, hostID int) (*adc
 	return host, host.Cluster.ID, nil
 }
 
-func componentIDMap(comps []adcmclient.ComponentShort) map[string]string {
-	out := make(map[string]string, len(comps))
+func hostComponentSet(comps []adcmclient.ComponentShort) map[int]struct{} {
+	out := make(map[int]struct{}, len(comps))
 	for _, c := range comps {
-		out[c.Name] = strconv.Itoa(c.ID)
+		out[c.ID] = struct{}{}
 	}
 	return out
 }
@@ -164,7 +164,7 @@ func collectSystemdRules(
 	ctx context.Context,
 	client *adcmclient.Client,
 	clusterID int,
-	compIDs map[string]string,
+	hostComps map[int]struct{},
 	log *slog.Logger,
 ) (map[string][]string, error) {
 	services, err := client.ListClusterServices(ctx, clusterID)
@@ -173,19 +173,23 @@ func collectSystemdRules(
 	}
 	unitToComps := make(map[string][]string)
 	for _, svc := range services {
-		if svcErr := addServiceRules(ctx, client, clusterID, svc, compIDs, log, unitToComps); svcErr != nil {
+		if svcErr := addServiceRules(ctx, client, clusterID, svc, hostComps, log, unitToComps); svcErr != nil {
 			return nil, svcErr
 		}
 	}
 	return unitToComps, nil
 }
 
+// addServiceRules maps this service's systemd components to the host. Component
+// names are resolved to ids via the service's own component list, so a name
+// reused by another service (e.g. "historyserver") cannot attach a foreign
+// unit; only components actually mapped to the host are kept.
 func addServiceRules(
 	ctx context.Context,
 	client *adcmclient.Client,
 	clusterID int,
 	svc adcmclient.ServiceObject,
-	compIDs map[string]string,
+	hostComps map[int]struct{},
 	log *slog.Logger,
 	unitToComps map[string][]string,
 ) error {
@@ -200,16 +204,30 @@ func addServiceRules(
 	if cfgErr != nil {
 		return cfgErr
 	}
+	if len(cfg.Components) == 0 {
+		return nil
+	}
+	svcComps, listErr := client.ListServiceComponents(ctx, clusterID, svc.ID)
+	if listErr != nil {
+		return listErr
+	}
+	nameToID := make(map[string]int, len(svcComps))
+	for _, sc := range svcComps {
+		nameToID[sc.Name] = sc.ID
+	}
 	for compName, raw := range cfg.Components {
-		compID, ok := compIDs[compName]
+		compID, ok := nameToID[compName]
 		if !ok {
+			continue
+		}
+		if _, onHost := hostComps[compID]; !onHost {
 			continue
 		}
 		unit, ok := parseSystemdUnit(raw, log, svc.Name, compName)
 		if !ok {
 			continue
 		}
-		unitToComps[unit] = append(unitToComps[unit], compID)
+		unitToComps[unit] = append(unitToComps[unit], strconv.Itoa(compID))
 	}
 	return nil
 }

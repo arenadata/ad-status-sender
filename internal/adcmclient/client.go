@@ -672,10 +672,17 @@ func (c *Client) GetHost(ctx context.Context, hostID int) (*HostObject, error) {
 }
 
 func (c *Client) ListClusterServices(ctx context.Context, clusterID int) ([]ServiceObject, error) {
-	var out []ServiceObject
-	nextURL := fmt.Sprintf("%s/api/v2/clusters/%d/services/", c.baseURL, clusterID)
+	url := fmt.Sprintf("%s/api/v2/clusters/%d/services/", c.baseURL, clusterID)
+	return listPaged[ServiceObject](ctx, c, url, "list services")
+}
+
+// listPaged walks an ADCM paginated list endpoint, following relative or
+// absolute `next` links, and returns all results decoded as T.
+func listPaged[T any](ctx context.Context, c *Client, firstURL, label string) ([]T, error) {
+	var out []T
+	nextURL := firstURL
 	for nextURL != "" {
-		page, next, err := c.fetchServicePage(ctx, nextURL)
+		page, next, err := fetchPage[T](ctx, c, nextURL, label)
 		if err != nil {
 			return nil, err
 		}
@@ -685,7 +692,7 @@ func (c *Client) ListClusterServices(ctx context.Context, clusterID int) ([]Serv
 	return out, nil
 }
 
-func (c *Client) fetchServicePage(ctx context.Context, fullURL string) ([]ServiceObject, string, error) {
+func fetchPage[T any](ctx context.Context, c *Client, fullURL, label string) ([]T, string, error) {
 	headers := map[string]string{headerAccept: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodGet, fullURL, nil, headers)
 	if err != nil {
@@ -694,11 +701,11 @@ func (c *Client) fetchServicePage(ctx context.Context, fullURL string) ([]Servic
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != statusClassSuccess {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("list services status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, "", fmt.Errorf("%s status %d: %s", label, resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	var body struct {
-		Next    *string         `json:"next"`
-		Results []ServiceObject `json:"results"`
+		Next    *string `json:"next"`
+		Results []T     `json:"results"`
 	}
 	if decodeErr := json.NewDecoder(resp.Body).Decode(&body); decodeErr != nil {
 		return nil, "", decodeErr
@@ -771,4 +778,13 @@ func (c *Client) GetServiceConfig(ctx context.Context, clusterID, serviceID, con
 		return ServiceConfig{}, decodeErr
 	}
 	return ServiceConfig{ID: body.ID, Components: body.Config.Components}, nil
+}
+
+// ListServiceComponents returns a service's components (id + name). Component
+// names are unique only within a service, so this scopes a config's component
+// names back to ids without conflating same-named components across services
+// (e.g. "historyserver" in spark3/spark4/yarn).
+func (c *Client) ListServiceComponents(ctx context.Context, clusterID, serviceID int) ([]ComponentShort, error) {
+	url := fmt.Sprintf("%s/api/v2/clusters/%d/services/%d/components/", c.baseURL, clusterID, serviceID)
+	return listPaged[ComponentShort](ctx, c, url, "list components")
 }

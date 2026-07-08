@@ -52,6 +52,13 @@ func TestFromADCM_SystemdMapping(t *testing.T) {
 					{"id": configID, "isCurrent": true},
 				},
 			})
+		case "/api/v2/clusters/10/services/55/components/":
+			writeJSON(w, map[string]any{
+				"results": []map[string]any{
+					{"id": 101, "name": "rest"},
+					{"id": 102, "name": "master"},
+				},
+			})
 		case "/api/v2/clusters/10/services/55/configs/100/":
 			components := map[string]string{
 				"rest":   `{"systemd":{"service_name":"hbase-rest"}}`,
@@ -102,6 +109,64 @@ func TestFromADCM_SystemdMapping(t *testing.T) {
 	}
 	if len(got["hbase-master.service"]) != 1 || got["hbase-master.service"][0] != "102" {
 		t.Fatalf("master rule mismatch: %v", got["hbase-master.service"])
+	}
+}
+
+// Two services (spark3 id52, spark4 id59) each expose a component named
+// "historyserver" with distinct ids (169 vs 193). The host maps only spark3's
+// 169, so only spark3-history-server must attach — matching by bare name would
+// wrongly also glue spark4-history-server onto 169 and post a false down.
+func TestFromADCM_CrossServiceNameCollision(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/hosts/7/":
+			writeJSON(w, map[string]any{
+				"id":      7,
+				"name":    "host-7",
+				"cluster": map[string]any{"id": 10, "name": "c1"},
+				"components": []map[string]any{
+					{"id": 169, "name": "historyserver", "displayName": "Spark3 History Server"},
+				},
+			})
+		case "/api/v2/clusters/10/services/":
+			writeJSON(
+				w,
+				map[string]any{"results": []map[string]any{{"id": 52, "name": "spark3"}, {"id": 59, "name": "spark4"}}},
+			)
+		case "/api/v2/clusters/10/services/52/configs/":
+			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 520, "isCurrent": true}}})
+		case "/api/v2/clusters/10/services/59/configs/":
+			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 590, "isCurrent": true}}})
+		case "/api/v2/clusters/10/services/52/components/":
+			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 169, "name": "historyserver"}}})
+		case "/api/v2/clusters/10/services/59/components/":
+			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 193, "name": "historyserver"}}})
+		case "/api/v2/clusters/10/services/52/configs/520/":
+			writeJSON(w, map[string]any{"id": 520, "config": map[string]any{"components": map[string]string{
+				"historyserver": `{"systemd":{"service_name":"spark3-history-server"}}`,
+			}}})
+		case "/api/v2/clusters/10/services/59/configs/590/":
+			writeJSON(w, map[string]any{"id": 590, "config": map[string]any{"components": map[string]string{
+				"historyserver": `{"systemd":{"service_name":"spark4-history-server"}}`,
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	rr := importAndLoad(ctx, t, srv, 7)
+	if len(rr.Systemd) != 1 {
+		t.Fatalf("systemd rules=%d, want 1 (only spark3): %+v", len(rr.Systemd), rr.Systemd)
+	}
+	if rr.Systemd[0].Unit != "spark3-history-server.service" {
+		t.Fatalf("unit=%q, want spark3-history-server.service", rr.Systemd[0].Unit)
+	}
+	if !hasTarget(rr.Systemd[0].ComponentTargets, 0, "169") {
+		t.Fatalf("missing target {0 169}: %v", rr.Systemd[0].ComponentTargets)
 	}
 }
 
@@ -198,6 +263,13 @@ func TestFromADCM_SharedHostDuplicates(t *testing.T) {
 			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 100, "isCurrent": true}}})
 		case "/api/v2/clusters/20/services/66/configs/":
 			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 200, "isCurrent": true}}})
+		case "/api/v2/clusters/10/services/55/components/":
+			writeJSON(
+				w,
+				map[string]any{"results": []map[string]any{{"id": 101, "name": "rest"}, {"id": 102, "name": "master"}}},
+			)
+		case "/api/v2/clusters/20/services/66/components/":
+			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 201, "name": "rest"}}})
 		case "/api/v2/clusters/10/services/55/configs/100/":
 			writeJSON(w, map[string]any{"id": 100, "config": map[string]any{"components": map[string]string{
 				"rest":   `{"systemd":{"service_name":"hbase-rest"}}`,
@@ -258,6 +330,10 @@ func sharedHostHandler(dup8 http.HandlerFunc) http.HandlerFunc {
 			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 100, "isCurrent": true}}})
 		case "/api/v2/clusters/20/services/66/configs/":
 			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 200, "isCurrent": true}}})
+		case "/api/v2/clusters/10/services/55/components/":
+			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 101, "name": "rest"}}})
+		case "/api/v2/clusters/20/services/66/components/":
+			writeJSON(w, map[string]any{"results": []map[string]any{{"id": 201, "name": "rest"}}})
 		case "/api/v2/clusters/10/services/55/configs/100/":
 			writeJSON(w, restCfg)
 		case "/api/v2/clusters/20/services/66/configs/200/":
@@ -377,8 +453,18 @@ func TestFromADCM_TwoDuplicates_Aggregated(t *testing.T) {
 			})
 		default:
 			// Every cluster (10/20/30) serves the same hbase service 55, config
-			// 100, and rest systemd config.
+			// 100, and rest systemd config. The rest component id is host-scoped
+			// per cluster (101/201/301) so it matches that host's mapping.
 			switch {
+			case strings.HasSuffix(r.URL.Path, "/components/"):
+				id := 101
+				if strings.Contains(r.URL.Path, "/clusters/20/") {
+					id = 201
+				}
+				if strings.Contains(r.URL.Path, "/clusters/30/") {
+					id = 301
+				}
+				writeJSON(w, map[string]any{"results": []map[string]any{{"id": id, "name": "rest"}}})
 			case strings.HasSuffix(r.URL.Path, "/configs/100/"):
 				writeJSON(w, restCfg)
 			case strings.HasSuffix(r.URL.Path, "/configs/"):
