@@ -19,6 +19,27 @@ import (
 
 type TokenProvider func(context.Context) (string, error)
 
+// HTTPStatusError is returned when ADCM answers with a non-2xx status, so
+// callers can distinguish permanent (404/403) from transient (5xx) failures.
+type HTTPStatusError struct {
+	Code int
+	Body string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("http status %d: %s", e.Code, e.Body)
+}
+
+// HTTPStatusCode reports the ADCM status code carried by err, if any. A missing
+// code (network/transport error) returns ok=false.
+func HTTPStatusCode(err error) (int, bool) {
+	var e *HTTPStatusError
+	if errors.As(err, &e) {
+		return e.Code, true
+	}
+	return 0, false
+}
+
 const (
 	defaultHTTPTimeout = 10 * time.Second
 	statusClassSuccess = 2
@@ -105,6 +126,15 @@ type HostObject struct {
 	Name       string           `json:"name"`
 	Cluster    *clusterRef      `json:"cluster"`
 	Components []ComponentShort `json:"components"`
+	// Duplicates lists the shared-host duplicate rows (ids only) of an original
+	// host. Present on GET /hosts/<id>/; each duplicate carries its own cluster
+	// and components fetched via a separate GetHost.
+	Duplicates []HostDuplicate `json:"duplicates"`
+}
+
+type HostDuplicate struct {
+	ID      int         `json:"id"`
+	Cluster *clusterRef `json:"cluster"`
 }
 
 type clusterRef struct {
@@ -632,7 +662,7 @@ func (c *Client) GetHost(ctx context.Context, hostID int) (*HostObject, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != statusClassSuccess {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("get host status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, &HTTPStatusError{Code: resp.StatusCode, Body: strings.TrimSpace(string(b))}
 	}
 	var body HostObject
 	if decodeErr := json.NewDecoder(resp.Body).Decode(&body); decodeErr != nil {

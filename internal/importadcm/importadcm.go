@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 
 	"github.com/arenadata/ad-status-sender/internal/adcmclient"
+	"github.com/arenadata/ad-status-sender/internal/rules"
 	"github.com/arenadata/ad-status-sender/internal/rulesimport"
 	"github.com/arenadata/ad-status-sender/internal/storage/sqlite"
 )
@@ -33,12 +35,82 @@ func FromADCM(ctx context.Context, tx *sql.Tx, client *adcmclient.Client, hostID
 	if _, ehErr := sqlite.EnsureHostTx(ctx, tx, hostID, host.Name); ehErr != nil {
 		return fmt.Errorf("ensure host %d: %w", hostID, ehErr)
 	}
-	compIDs := componentIDMap(host.Components)
+
+	unitToTargets := make(map[string][]rules.ComponentTarget)
+	// Primary row: components post under the scoped host, so tag with host_id 0.
+	if rErr := addRow(ctx, client, clusterID, host.Components, 0, unitToTargets, log); rErr != nil {
+		return rErr
+	}
+	// Shared-host duplicates live in other clusters and get NO server-side
+	// component fan-out; enumerate each and tag its components with its own id.
+	for _, dup := range host.Duplicates {
+		if dErr := addDuplicateRow(ctx, client, dup.ID, unitToTargets, log); dErr != nil {
+			return dErr
+		}
+	}
+	return persistRules(ctx, tx, hostID, unitToTargets)
+}
+
+// addRow expands one host's cluster services into unit -> component targets,
+// tagging every component with hostTag (0 for the primary, the duplicate id
+// otherwise).
+func addRow(
+	ctx context.Context,
+	client *adcmclient.Client,
+	clusterID int,
+	comps []adcmclient.ComponentShort,
+	hostTag int,
+	unitToTargets map[string][]rules.ComponentTarget,
+	log *slog.Logger,
+) error {
+	compIDs := componentIDMap(comps)
 	unitToComps, err := collectSystemdRules(ctx, client, clusterID, compIDs, log)
 	if err != nil {
 		return err
 	}
-	return persistRules(ctx, tx, hostID, unitToComps)
+	for unit, ids := range unitToComps {
+		for _, id := range ids {
+			unitToTargets[unit] = append(unitToTargets[unit], rules.ComponentTarget{HostID: hostTag, ComponentID: id})
+		}
+	}
+	return nil
+}
+
+// addDuplicateRow enumerates one duplicate. A permanent condition (host gone,
+// forbidden, or unclustered) is skipped, since dropping its targets is correct.
+// A transient failure (5xx / network) is propagated so the whole import rolls
+// back: FromADCM replaces the rule set, and committing a partial snapshot would
+// silently wipe a still-valid duplicate's targets until the next successful sync.
+func addDuplicateRow(
+	ctx context.Context,
+	client *adcmclient.Client,
+	dupID int,
+	unitToTargets map[string][]rules.ComponentTarget,
+	log *slog.Logger,
+) error {
+	dup, err := client.GetHost(ctx, dupID)
+	if err != nil {
+		if permanentFetchError(err) {
+			log.WarnContext(ctx, "adcm shared-host duplicate skipped: fetch failed", "duplicate", dupID, "err", err)
+			return nil
+		}
+		return fmt.Errorf("fetch duplicate %d: %w", dupID, err)
+	}
+	if dup.Cluster == nil {
+		log.WarnContext(ctx, "adcm shared-host duplicate skipped: no cluster", "duplicate", dupID)
+		return nil
+	}
+	if rErr := addRow(ctx, client, dup.Cluster.ID, dup.Components, dupID, unitToTargets, log); rErr != nil {
+		return fmt.Errorf("duplicate %d rules: %w", dupID, rErr)
+	}
+	return nil
+}
+
+// permanentFetchError is true for 404 (deleted/un-shared) and 403 (no RBAC
+// visibility); both mean the duplicate's targets should be dropped, not retried.
+func permanentFetchError(err error) bool {
+	code, ok := adcmclient.HTTPStatusCode(err)
+	return ok && (code == http.StatusNotFound || code == http.StatusForbidden)
 }
 
 func parseSystemdUnit(raw string, log *slog.Logger, serviceName, componentName string) (string, bool) {
@@ -146,11 +218,11 @@ func persistRules(
 	ctx context.Context,
 	tx *sql.Tx,
 	hostID int,
-	unitToComps map[string][]string,
+	unitToTargets map[string][]rules.ComponentTarget,
 ) error {
-	for unit, comps := range unitToComps {
-		comps = rulesimport.DedupTrim(comps)
-		if len(comps) == 0 {
+	for unit, targets := range unitToTargets {
+		targets = dedupTargets(targets)
+		if len(targets) == 0 {
 			continue
 		}
 		ruleName := "adcm/" + unit
@@ -158,12 +230,30 @@ func persistRules(
 		if upErr != nil {
 			return upErr
 		}
-		if setErr := sqlite.SetRuleComponentsTx(ctx, tx, ruleID, comps); setErr != nil {
+		if setErr := sqlite.SetRuleComponentTargetsTx(ctx, tx, ruleID, targets); setErr != nil {
 			return setErr
 		}
+		// Rules are always scoped to the original host: the daemon loads by the
+		// configured (original) id; duplicate ids ride along as component targets.
 		if scErr := rulesimport.ApplyHostScope(ctx, tx, ruleID, []int{hostID}); scErr != nil {
 			return scErr
 		}
 	}
 	return nil
+}
+
+func dedupTargets(in []rules.ComponentTarget) []rules.ComponentTarget {
+	seen := make(map[rules.ComponentTarget]struct{}, len(in))
+	out := make([]rules.ComponentTarget, 0, len(in))
+	for _, t := range in {
+		if t.ComponentID == "" {
+			continue
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
 }

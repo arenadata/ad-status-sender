@@ -141,6 +141,25 @@ func SetRuleComponentsTx(ctx context.Context, tx *sql.Tx, ruleID int64, componen
 	return nil
 }
 
+// SetRuleComponentTargetsTx replaces a rule's component targets, each carrying a
+// host_id (0 = the rule's scoped host, non-zero = a shared-host duplicate).
+func SetRuleComponentTargetsTx(ctx context.Context, tx *sql.Tx, ruleID int64, targets []rules.ComponentTarget) error {
+	if _, delErr := tx.ExecContext(ctx, `DELETE FROM rule_component WHERE rule_id=?`, ruleID); delErr != nil {
+		return delErr
+	}
+	for _, t := range targets {
+		if t.ComponentID == "" {
+			continue
+		}
+		if _, insErr := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO rule_component(rule_id, component_id, host_id) VALUES(?,?,?)`,
+			ruleID, t.ComponentID, t.HostID); insErr != nil {
+			return insErr
+		}
+	}
+	return nil
+}
+
 func SetRuleHostScopeTx(ctx context.Context, tx *sql.Tx, ruleID int64, hostIDs []int) error {
 	if _, delErr := tx.ExecContext(ctx, `DELETE FROM rule_host_scope WHERE rule_id=?`, ruleID); delErr != nil {
 		return delErr
@@ -229,15 +248,16 @@ WHERE r.enabled=1 AND r.kind='systemd'
 		return out, rowsErr
 	}
 	for _, t := range sys {
-		comp, compErr := s.listComponents(ctx, t.id)
+		targets, compErr := s.listComponentTargets(ctx, t.id)
 		if compErr != nil {
 			return out, compErr
 		}
 		out.Systemd = append(out.Systemd, rules.RuleSystemd{
-			Name:       t.name.String,
-			Unit:       t.unit.String,
-			UnitGlob:   t.unitGlob.String,
-			Components: comp,
+			Name:             t.name.String,
+			Unit:             t.unit.String,
+			UnitGlob:         t.unitGlob.String,
+			Components:       componentIDs(targets),
+			ComponentTargets: targets,
 		})
 	}
 
@@ -279,39 +299,58 @@ WHERE r.enabled=1 AND r.kind='docker'
 		if lErr != nil {
 			return out, lErr
 		}
-		comp, compErr := s.listComponents(ctx, t.id)
+		targets, compErr := s.listComponentTargets(ctx, t.id)
 		if compErr != nil {
 			return out, compErr
 		}
 		out.Docker = append(out.Docker, rules.RuleDocker{
-			Name:       t.name.String,
-			Components: comp,
-			Containers: rules.DockerSelector{Names: names, Labels: labels},
+			Name:             t.name.String,
+			Components:       componentIDs(targets),
+			Containers:       rules.DockerSelector{Names: names, Labels: labels},
+			ComponentTargets: targets,
 		})
 	}
 	return out, nil
 }
 
-func (s *Store) listComponents(ctx context.Context, ruleID int64) ([]string, error) {
-	rows, qErr := s.db.QueryContext(ctx, `SELECT component_id FROM rule_component WHERE rule_id=?`, ruleID)
+func (s *Store) listComponentTargets(ctx context.Context, ruleID int64) ([]rules.ComponentTarget, error) {
+	rows, qErr := s.db.QueryContext(ctx,
+		`SELECT component_id, host_id FROM rule_component WHERE rule_id=? ORDER BY host_id, component_id`, ruleID)
 	if qErr != nil {
 		return nil, qErr
 	}
 	defer rows.Close()
 
-	var out []string
+	var out []rules.ComponentTarget
 	for rows.Next() {
-		var v string
-		scErr := rows.Scan(&v)
-		if scErr != nil {
+		var t rules.ComponentTarget
+		if scErr := rows.Scan(&t.ComponentID, &t.HostID); scErr != nil {
 			return nil, scErr
 		}
-		out = append(out, v)
+		out = append(out, t)
 	}
 	if rowsErr := rows.Err(); rowsErr != nil {
 		return nil, rowsErr
 	}
 	return out, nil
+}
+
+// componentIDs projects targets to bare component ids for callers that inspect
+// rules.Rules.Components (yaml round-trip, legacy tests).
+func componentIDs(targets []rules.ComponentTarget) []string {
+	if len(targets) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(targets))
+	out := make([]string, 0, len(targets))
+	for _, t := range targets {
+		if _, ok := seen[t.ComponentID]; ok {
+			continue
+		}
+		seen[t.ComponentID] = struct{}{}
+		out = append(out, t.ComponentID)
+	}
+	return out
 }
 
 func (s *Store) listDockerNames(ctx context.Context, ruleID int64) ([]string, error) {

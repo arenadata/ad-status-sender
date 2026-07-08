@@ -793,9 +793,9 @@ func (r *Runner) scanOnce(ctx context.Context) {
 	// component listed under both a systemd and a docker rule posts a single
 	// status per scan instead of two rules fighting (0/1 flap).
 	for id, chk := range r.buildScanPlan(ctx, sd) {
-		compID, checks := id, chk
+		key, checks := id, chk
 		r.enqueue(func() {
-			r.evalAndPostComponent(ctx, cfg, compID, checks, sd, dck, force)
+			r.evalAndPostComponent(ctx, cfg, key, checks, sd, dck, force)
 		})
 	}
 	r.sendHeartbeat(ctx, cfg, force)
@@ -807,6 +807,13 @@ func (r *Runner) snapshot() (config.Config, time.Duration) {
 	return r.cfg, r.forceAfter
 }
 
+// compKey identifies a status target: a component on a specific host. HostID 0
+// means the configured (original) host; a non-zero id is a shared-host duplicate.
+type compKey struct {
+	hostID int
+	compID string
+}
+
 // compChecks is the set of checks a single component depends on, gathered
 // across all rules that reference it.
 type compChecks struct {
@@ -814,16 +821,17 @@ type compChecks struct {
 	dockerSels []rules.DockerSelector
 }
 
-// buildScanPlan maps each component to every check that determines its status.
-// Systemd globs are expanded once here so the per-component job can aggregate.
-func (r *Runner) buildScanPlan(ctx context.Context, sd check.Systemd) map[string]*compChecks {
+// buildScanPlan maps each (host, component) target to every check that
+// determines its status. Systemd globs are expanded once here so the per-target
+// job can aggregate.
+func (r *Runner) buildScanPlan(ctx context.Context, sd check.Systemd) map[compKey]*compChecks {
 	rr := r.ruleStore.Get()
-	plan := make(map[string]*compChecks)
-	get := func(comp string) *compChecks {
-		cc, ok := plan[comp]
+	plan := make(map[compKey]*compChecks)
+	get := func(k compKey) *compChecks {
+		cc, ok := plan[k]
 		if !ok {
 			cc = &compChecks{}
-			plan[comp] = cc
+			plan[k] = cc
 		}
 		return cc
 	}
@@ -835,13 +843,15 @@ func (r *Runner) buildScanPlan(ctx context.Context, sd check.Systemd) map[string
 		if rule.UnitGlob != "" && sd != nil {
 			units = append(units, sd.ExpandUnitsByGlob(ctx, rule.UnitGlob)...)
 		}
-		for _, comp := range rule.Components {
-			get(comp).units = append(get(comp).units, units...)
+		for _, t := range rule.Targets() {
+			cc := get(compKey{t.HostID, t.ComponentID})
+			cc.units = append(cc.units, units...)
 		}
 	}
 	for _, d := range rr.Docker {
-		for _, comp := range d.Components {
-			get(comp).dockerSels = append(get(comp).dockerSels, d.Containers)
+		for _, t := range d.Targets() {
+			cc := get(compKey{t.HostID, t.ComponentID})
+			cc.dockerSels = append(cc.dockerSels, d.Containers)
 		}
 	}
 	return plan
@@ -854,7 +864,7 @@ func (r *Runner) buildScanPlan(ctx context.Context, sd check.Systemd) map[string
 func (r *Runner) evalAndPostComponent(
 	ctx context.Context,
 	cfg config.Config,
-	compID string,
+	key compKey,
 	chk *compChecks,
 	sd check.Systemd,
 	dck check.Docker,
@@ -885,7 +895,7 @@ func (r *Runner) evalAndPostComponent(
 	if !determined {
 		return
 	}
-	r.maybePostComponent(ctx, cfg, compID, status, forceAfter)
+	r.maybePostComponent(ctx, cfg, key, status, forceAfter)
 }
 
 func dockerStatus(ctx context.Context, dck check.Docker, sel rules.DockerSelector) int {
@@ -913,11 +923,15 @@ func (r *Runner) enqueue(fn func()) {
 func (r *Runner) maybePostComponent(
 	ctx context.Context,
 	cfg config.Config,
-	compID string,
+	target compKey,
 	status int,
 	forceAfter time.Duration,
 ) {
-	key := fmt.Sprintf("comp:%d:%s", cfg.HostID, compID)
+	hostID := target.hostID
+	if hostID == 0 {
+		hostID = cfg.HostID
+	}
+	key := fmt.Sprintf("comp:%d:%s", hostID, target.compID)
 	// Serialize per key so concurrent scans of a flapping unit cannot post
 	// out of order or race shouldSend/markSent.
 	unlock := r.postKeys.lock(key)
@@ -926,8 +940,8 @@ func (r *Runner) maybePostComponent(
 		return
 	}
 	if post := r.poster(); post != nil {
-		if err := post.PostComponent(ctx, compID, status); err != nil {
-			r.log.WarnContext(ctx, "post component failed", "comp", compID, "err", err)
+		if err := post.PostComponent(ctx, hostID, target.compID, status); err != nil {
+			r.log.WarnContext(ctx, "post component failed", "host", hostID, "comp", target.compID, "err", err)
 			return
 		}
 	}
