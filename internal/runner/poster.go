@@ -6,5 +6,5 @@ import (
 
 type Poster interface {
 	PostHost(ctx context.Context, status int) error
-	PostComponent(ctx context.Context, compID string, status int) error
+	PostComponent(ctx context.Context, hostID int, compID string, status int) error
 }

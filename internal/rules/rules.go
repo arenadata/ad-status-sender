@@ -18,11 +18,26 @@ type Rules struct {
 	Docker  []RuleDocker  `json:"docker"  yaml:"docker"`
 }
 
+// ComponentTarget is a component the daemon must report status for. HostID 0
+// means the rule's scoped host (yaml/legacy); a non-zero HostID names an ADCM
+// shared-host duplicate whose component status must be posted under that id.
+type ComponentTarget struct {
+	HostID      int    `json:"host_id,omitempty" yaml:"host_id,omitempty"`
+	ComponentID string `json:"component_id"      yaml:"component_id"`
+}
+
 type RuleSystemd struct {
 	Name       string   `json:"name"       yaml:"name"`
 	Unit       string   `json:"unit"       yaml:"unit"`
 	UnitGlob   string   `json:"unit_glob"  yaml:"unit_glob"`
 	Components []string `json:"components" yaml:"components"`
+	// ComponentTargets carries per-host targeting for shared hosts. When empty,
+	// Components is used with HostID 0. Populated by the DB loader, not by yaml.
+	ComponentTargets []ComponentTarget `json:"component_targets,omitempty" yaml:"component_targets,omitempty"`
+}
+
+func (r RuleSystemd) Targets() []ComponentTarget {
+	return EffectiveTargets(r.Components, r.ComponentTargets)
 }
 
 type DockerSelector struct {
@@ -31,9 +46,30 @@ type DockerSelector struct {
 }
 
 type RuleDocker struct {
-	Name       string         `json:"name"       yaml:"name"`
-	Components []string       `json:"components" yaml:"components"`
-	Containers DockerSelector `json:"containers" yaml:"containers"`
+	Name             string            `json:"name"                        yaml:"name"`
+	Components       []string          `json:"components"                  yaml:"components"`
+	Containers       DockerSelector    `json:"containers"                  yaml:"containers"`
+	ComponentTargets []ComponentTarget `json:"component_targets,omitempty" yaml:"component_targets,omitempty"`
+}
+
+func (r RuleDocker) Targets() []ComponentTarget {
+	return EffectiveTargets(r.Components, r.ComponentTargets)
+}
+
+// EffectiveTargets prefers explicit per-host targets; otherwise it maps each
+// component string to HostID 0 (the rule's scoped host).
+func EffectiveTargets(components []string, targets []ComponentTarget) []ComponentTarget {
+	if len(targets) > 0 {
+		return targets
+	}
+	out := make([]ComponentTarget, 0, len(components))
+	for _, c := range components {
+		if c == "" {
+			continue
+		}
+		out = append(out, ComponentTarget{ComponentID: c})
+	}
+	return out
 }
 
 func Load(path string) (Rules, error) {

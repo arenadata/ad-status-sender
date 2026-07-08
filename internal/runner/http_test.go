@@ -53,7 +53,7 @@ func TestADCMPPoster_HostAndComponent(t *testing.T) {
 		client: client2,
 		hostID: 7,
 	}
-	if err := p2.PostComponent(context.Background(), "42", 1); err != nil {
+	if err := p2.PostComponent(context.Background(), 7, "42", 1); err != nil {
 		t.Fatalf("PostComponent err: %v", err)
 	}
 	if lastURL != "/status/api/v1/host/7/component/42/" || lastAuth != "Token ZZ" {

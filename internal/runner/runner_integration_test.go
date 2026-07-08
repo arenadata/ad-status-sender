@@ -32,6 +32,7 @@ func (c *testClock) advance(d time.Duration) {
 
 type sentEvent struct {
 	IsHost bool
+	HostID int
 	CompID string
 	Status int
 }
@@ -46,9 +47,9 @@ func (p *testPoster) PostHost(_ context.Context, status int) error {
 	p.mu.Unlock()
 	return nil
 }
-func (p *testPoster) PostComponent(_ context.Context, compID string, status int) error {
+func (p *testPoster) PostComponent(_ context.Context, hostID int, compID string, status int) error {
 	p.mu.Lock()
-	p.list = append(p.list, sentEvent{IsHost: false, CompID: compID, Status: status})
+	p.list = append(p.list, sentEvent{IsHost: false, HostID: hostID, CompID: compID, Status: status})
 	p.mu.Unlock()
 	return nil
 }
