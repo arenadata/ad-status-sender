@@ -44,12 +44,19 @@ func main() {
 	}
 	logger := slog.New(handler)
 
+	logger.Info("ad-status-sender starting",
+		"host_id", cfg.HostID,
+		"rules_source", cfg.RulesSource,
+		"adcm_url", cfg.ADCMURL,
+	)
+
 	r := runner.NewWithLogger(cfgPath, logger)
 	if rErr := r.Start(); rErr != nil {
 		logger.Error("start failed", "err", rErr)
 		os.Exit(1)
 	}
 	_, _ = sd.SdNotify(false, sd.SdNotifyReady)
+	logger.Info("ad-status-sender started")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
