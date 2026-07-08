@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/pressly/goose/v3"
@@ -23,6 +24,10 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Per-connection PRAGMAs (foreign_keys, busy_timeout) below are set on one
+	// connection; pin the pool to a single connection so every query sees them
+	// and sqlite's single-writer model is respected.
+	db.SetMaxOpenConns(1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), pragmaTimeout)
 	defer cancel()
@@ -47,7 +52,15 @@ func Open(dsn string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// gooseMu serializes goose's process-global dialect/baseFS state, which is
+// mutated on every migrate; concurrent Open() calls would otherwise race.
+//
+//nolint:gochecknoglobals // guards goose's own process-global state; must be package-level
+var gooseMu sync.Mutex
+
 func migrateUp(ctx context.Context, db *sql.DB) error {
+	gooseMu.Lock()
+	defer gooseMu.Unlock()
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		return fmt.Errorf("goose dialect: %w", err)
 	}

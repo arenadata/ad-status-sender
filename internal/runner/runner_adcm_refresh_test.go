@@ -88,9 +88,14 @@ func TestRunner_ADCMRefreshSyncer(t *testing.T) {
 		RulesRefresh: "50ms",
 	}
 	r.mu.Unlock()
-	if err := r.openDB(rulesDB); err != nil {
+	db, dsn, err := r.reopenDB(rulesDB)
+	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
+	r.mu.Lock()
+	r.db = db
+	r.dbPath = dsn
+	r.mu.Unlock()
 	t.Cleanup(func() {
 		if r.db != nil {
 			_ = r.db.Close()

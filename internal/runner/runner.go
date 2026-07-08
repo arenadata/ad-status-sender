@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -27,16 +28,21 @@ import (
 )
 
 const (
-	jobQueueSize       = 2048
-	httpMaxIdle        = 100
-	httpMaxIdlePerHost = 100
-	httpIdleTimeout    = 90 * time.Second
+	jobQueueSize         = 2048
+	httpMaxIdle          = 100
+	httpMaxIdlePerHost   = 100
+	httpIdleTimeout      = 90 * time.Second
+	shutdownDrainTimeout = 15 * time.Second
 
 	defaultInterval     = 5 * time.Second
 	defaultHTTPTimeout  = 5 * time.Second
 	defaultForceSend    = 120 * time.Second
 	defaultRulesRefresh = 60 * time.Second
 	legacyDebounceDelay = 150 * time.Millisecond
+
+	// rulesRefreshJitterFrac spreads rule-sync ticks by up to interval/frac so
+	// daemons started together don't hit ADCM in a synchronized burst.
+	rulesRefreshJitterFrac = 4
 
 	rulesSourceYAML   = "yaml"
 	rulesSourceLegacy = "legacy"
@@ -59,8 +65,11 @@ type Runner struct {
 
 	tickerMu    sync.Mutex
 	ticker      Ticker
+	tickerReset chan struct{}
 	jobs        chan func()
-	cancel      context.CancelFunc
+	scanCancel  context.CancelFunc
+	postCancel  context.CancelFunc
+	workerWg    sync.WaitGroup
 	rulesSyncMu sync.Mutex
 
 	sd   check.Systemd
@@ -71,11 +80,35 @@ type Runner struct {
 	cacheMu    sync.Mutex
 	cache      map[string]lastSend // key -> last
 	forceAfter time.Duration
+
+	postKeys keyedMutex
 }
 
 type lastSend struct {
 	status   int
 	lastTime time.Time
+}
+
+// keyedMutex hands out a mutex per string key so posts for the same key
+// serialize while different keys stay concurrent.
+type keyedMutex struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
+func (k *keyedMutex) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = make(map[string]*sync.Mutex)
+	}
+	km, ok := k.m[key]
+	if !ok {
+		km = &sync.Mutex{}
+		k.m[key] = km
+	}
+	k.mu.Unlock()
+	km.Lock()
+	return km.Unlock
 }
 
 func NewWithLogger(cfgPath string, logger *slog.Logger) *Runner {
@@ -119,54 +152,67 @@ func (r *Runner) Start() error {
 		r.log.Warn("rules initial load", "err", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	r.cancel = cancel
+	// scanCtx stops scheduling on shutdown; postCtx keeps in-flight checks and
+	// posts alive until they drain, so SIGTERM does not abort a status POST.
+	scanCtx, scanCancel := context.WithCancel(context.Background())
+	postCtx, postCancel := context.WithCancel(context.Background())
+	r.scanCancel = scanCancel
+	r.postCancel = postCancel
 	r.initRuntime()
 
-	r.startWorkers(ctx)
-	r.startTickerLoop(ctx)
+	r.startWorkers()
+	r.startTickerLoop(scanCtx, postCtx)
 	r.startRulesWatcher()
-	r.startRulesSyncer(ctx)
-	r.startLegacyWatcher(ctx)
+	r.startRulesSyncer(scanCtx)
+	r.startLegacyWatcher(scanCtx)
 	r.startSignalHandler()
 
 	return nil
 }
 
 func (r *Runner) Stop() {
-	if r.cancel != nil {
-		r.cancel()
+	if r.scanCancel != nil {
+		r.scanCancel() // stop scheduling; loop closes r.jobs after the current scan
 	}
 	r.closeStopWatch()
+	// Drain in-flight and queued posts before cancelling their context.
+	done := make(chan struct{})
+	go func() {
+		r.workerWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownDrainTimeout):
+		r.log.Warn("shutdown drain timed out; cancelling in-flight posts")
+	}
+	if r.postCancel != nil {
+		r.postCancel()
+	}
 }
 
 func (r *Runner) initRuntime() {
 	r.jobs = make(chan func(), jobQueueSize)
 	r.cache = make(map[string]lastSend)
+	r.tickerReset = make(chan struct{}, 1)
 }
 
-func (r *Runner) startWorkers(ctx context.Context) {
+func (r *Runner) startWorkers() {
 	n := r.cfg.Concurrency
 	for range n {
+		r.workerWg.Add(1)
 		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case fn, ok := <-r.jobs:
-					if !ok {
-						return
-					}
-					fn()
-				}
+			defer r.workerWg.Done()
+			for fn := range r.jobs { // exits once loop closes r.jobs and the queue drains
+				fn()
 			}
 		}()
 	}
 }
 
-func (r *Runner) startTickerLoop(ctx context.Context) {
+func (r *Runner) startTickerLoop(scanCtx, postCtx context.Context) {
 	r.resetTicker(config.MustDuration(r.cfg.Interval, defaultInterval))
-	go r.loop(ctx)
+	go r.loop(scanCtx, postCtx)
 }
 
 func (r *Runner) startRulesWatcher() {
@@ -174,16 +220,25 @@ func (r *Runner) startRulesWatcher() {
 	go func() {
 		r.mu.RLock()
 		src := r.cfg.RulesSource
+		path := r.cfg.RulesPath
 		r.mu.RUnlock()
 		if src != rulesSourceYAML {
 			return
 		}
-		err := rules.Watch(r.stopWatch, r.cfg.RulesPath, func(rr rules.Rules) {
+		err := rules.Watch(r.stopWatch, path, func(rr rules.Rules) {
+			r.mu.RLock()
+			cur := r.cfg.RulesSource
+			r.mu.RUnlock()
+			if cur != rulesSourceYAML {
+				return // source switched via reload; ignore stale yaml watcher
+			}
 			if syncErr := r.syncRulesWithImporter(context.Background(), yamlRulesImporter{rr: rr}); syncErr != nil {
 				r.log.Error("rules import", "err", syncErr)
 				return
 			}
 			r.log.Info("rules reloaded", "systemd", len(rr.Systemd), "docker", len(rr.Docker))
+		}, func(werr error) {
+			r.log.Error("rules watch", "err", werr)
 		})
 		if err != nil {
 			r.log.Error("rules watch", "err", err)
@@ -191,15 +246,23 @@ func (r *Runner) startRulesWatcher() {
 	}()
 }
 
+// jitteredInterval adds up to interval/rulesRefreshJitterFrac random delay to decorrelate ticks.
+func jitteredInterval(interval time.Duration) time.Duration {
+	span := int64(interval) / rulesRefreshJitterFrac
+	if span <= 0 {
+		return interval
+	}
+	return interval + time.Duration(rand.Int64N(span)) //nolint:gosec // G404: jitter, not security-sensitive
+}
+
 func (r *Runner) startRulesSyncer(ctx context.Context) {
 	go func() {
 		for {
 			r.mu.RLock()
-			src := r.cfg.RulesSource
 			interval := config.MustDuration(r.cfg.RulesRefresh, defaultRulesRefresh)
 			r.mu.RUnlock()
 
-			timer := time.NewTimer(interval)
+			timer := time.NewTimer(jitteredInterval(interval))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -208,9 +271,9 @@ func (r *Runner) startRulesSyncer(ctx context.Context) {
 			}
 			timer.Stop()
 
-			if src == rulesSourceYAML || src == rulesSourceLegacy {
-				continue
-			}
+			// Periodic re-sync for all sources: the primary trigger for yaml/legacy
+			// is fsnotify, but a lost watch (dir replaced, inotify limit) would
+			// otherwise leave rules stale forever. syncRules re-reads the source.
 			if err := r.syncRules(ctx); err != nil {
 				r.log.ErrorContext(ctx, "rules sync", "err", err)
 			}
@@ -374,25 +437,40 @@ func (r *Runner) reload() error {
 		return err
 	}
 
-	r.initCheckers()
+	sd, dck := r.ensureCheckers()
 
-	httpc := makeHTTPClient(auth.cfg)
+	httpc := makeHTTPClient(auth.cfg, r.log)
 	tok, err := r.ensureToken(auth, httpc)
 	if err != nil {
 		return err
 	}
-	r.adcm = r.buildADCMClient(auth, tok, httpc)
-	r.adcm.SetLogBodies(auth.cfg.LogBodies)
+	adcm := r.buildADCMClient(auth, tok, httpc)
+	adcm.SetLogBodies(auth.cfg.LogBodies)
+	poster := &adcmPoster{
+		log:       r.log,
+		client:    adcm,
+		hostID:    auth.cfg.HostID,
+		logBodies: auth.cfg.LogBodies,
+	}
 
-	r.updatePoster(auth.cfg)
+	// Hold rulesSyncMu so a db swap cannot close a store an in-flight sync is using.
+	r.rulesSyncMu.Lock()
+	defer r.rulesSyncMu.Unlock()
 
-	if openErr := r.openDB(auth.cfg.RulesDB); openErr != nil {
-		return openErr
+	db, dsn, err := r.reopenDB(auth.cfg.RulesDB)
+	if err != nil {
+		return err
 	}
 
 	r.mu.Lock()
 	r.cfg = auth.cfg
 	r.client = httpc
+	r.adcm = adcm
+	r.post = poster
+	r.sd = sd
+	r.dck = dck
+	r.db = db
+	r.dbPath = dsn
 	r.forceAfter = config.MustDuration(auth.cfg.ForceSendAfter, defaultForceSend)
 	r.mu.Unlock()
 
@@ -433,21 +511,38 @@ func loadAuthConfig(path string) (authConfig, error) {
 	}, nil
 }
 
-func (r *Runner) initCheckers() {
-	if r.dck == nil {
+// ensureCheckers returns the systemd/docker checkers, reusing existing ones and
+// creating any that are still nil (e.g. dbus/docker not ready at boot). Callers
+// publish the result under r.mu so a nil checker self-heals on a later scan
+// instead of latching every component DOWN forever.
+func (r *Runner) ensureCheckers() (check.Systemd, check.Docker) {
+	r.mu.RLock()
+	sd, dck := r.sd, r.dck
+	r.mu.RUnlock()
+	if dck == nil {
 		if d, err := check.NewDockerChecker(); err == nil {
-			r.dck = d
+			dck = d
 		} else {
 			r.log.Warn("docker init failed", "err", err)
 		}
 	}
-	if r.sd == nil {
+	if sd == nil {
 		if cli, err := check.NewSystemdClient(context.Background()); err == nil {
-			r.sd = cli
+			sd = cli
 		} else {
 			r.log.Warn("systemd dbus init failed", "err", err)
 		}
 	}
+	return sd, dck
+}
+
+// refreshCheckers self-heals nil checkers and publishes them for workers.
+func (r *Runner) refreshCheckers() (check.Systemd, check.Docker) {
+	sd, dck := r.ensureCheckers()
+	r.mu.Lock()
+	r.sd, r.dck = sd, dck
+	r.mu.Unlock()
+	return sd, dck
 }
 
 func (r *Runner) ensureToken(auth authConfig, httpc *http.Client) (string, error) {
@@ -469,8 +564,11 @@ func (r *Runner) ensureToken(auth authConfig, httpc *http.Client) (string, error
 
 func (r *Runner) buildADCMClient(auth authConfig, token string, httpc *http.Client) *adcmclient.Client {
 	var client *adcmclient.Client
+	var tokenMu sync.Mutex
 	lastToken := strings.TrimSpace(token)
 	tokenProvider := func(ctx context.Context) (string, error) {
+		tokenMu.Lock()
+		defer tokenMu.Unlock()
 		tok2, _ := config.LoadToken(&auth.cfg)
 		tok2 = strings.TrimSpace(tok2)
 		if tok2 != "" && tok2 != lastToken {
@@ -499,36 +597,22 @@ func (r *Runner) buildADCMClient(auth authConfig, token string, httpc *http.Clie
 		return "", err
 	}
 	client = adcmclient.NewWithTokenProvider(auth.cfg.ADCMURL, token, tokenProvider, httpc, r.log)
+	// adcm mode needs both rbac (rule import) and the status secret (POSTs); fetch
+	// the latter from the status-checker-token endpoint. Other sources deploy the
+	// secret as token, so status POSTs fall back to it with no provider.
+	if auth.cfg.RulesSource == rulesSourceADCM {
+		client.SetStatusTokenProvider(client.ObtainStatusToken)
+	}
 	return client
 }
 
-func (r *Runner) updatePoster(cfg config.Config) {
-	if r.post == nil {
-		r.post = &adcmPoster{
-			log:       r.log,
-			client:    r.adcm,
-			hostID:    cfg.HostID,
-			logBodies: cfg.LogBodies,
-		}
-		return
-	}
-	if ap, ok := r.post.(*adcmPoster); ok {
-		ap.client = r.adcm
-		ap.hostID = cfg.HostID
-		ap.logBodies = cfg.LogBodies
-	}
-	if r.adcm != nil {
-		r.adcm.SetLogBodies(cfg.LogBodies)
-	}
-}
-
-func makeHTTPClient(c config.Config) *http.Client {
-	tr := buildTransport(c)
+func makeHTTPClient(c config.Config, log *slog.Logger) *http.Client {
+	tr := buildTransport(c, log)
 	httpTimeout := config.MustDuration(c.HTTPTimeout, defaultHTTPTimeout)
 	return &http.Client{Timeout: httpTimeout, Transport: tr}
 }
 
-func buildTransport(c config.Config) *http.Transport {
+func buildTransport(c config.Config, log *slog.Logger) *http.Transport {
 	tr := &http.Transport{
 		MaxIdleConns:        httpMaxIdle,
 		MaxIdleConnsPerHost: httpMaxIdlePerHost,
@@ -537,25 +621,29 @@ func buildTransport(c config.Config) *http.Transport {
 	if !strings.HasPrefix(strings.ToLower(c.ADCMURL), "https://") {
 		return tr
 	}
-	tr.TLSClientConfig = buildTLSConfig(c)
+	tr.TLSClientConfig = buildTLSConfig(c, log)
 	return tr
 }
 
-func buildTLSConfig(c config.Config) *tls.Config {
+func buildTLSConfig(c config.Config, log *slog.Logger) *tls.Config {
 	tlsConf := &tls.Config{MinVersion: tls.VersionTLS12}
 	roots, sysErr := x509.SystemCertPool()
 	if sysErr != nil || roots == nil {
 		roots = x509.NewCertPool()
 	}
 	if strings.TrimSpace(c.TLS.CAFile) != "" {
-		if pem, rdErr := os.ReadFile(c.TLS.CAFile); rdErr == nil {
-			_ = roots.AppendCertsFromPEM(pem)
+		if pem, rdErr := os.ReadFile(c.TLS.CAFile); rdErr != nil {
+			log.Error("tls ca_file read failed", "file", c.TLS.CAFile, "err", rdErr)
+		} else if !roots.AppendCertsFromPEM(pem) {
+			log.Error("tls ca_file has no valid certificates", "file", c.TLS.CAFile)
 		}
 	}
 	tlsConf.RootCAs = roots
 
 	if c.TLS.CertFile != "" && c.TLS.KeyFile != "" {
-		if cert, ckErr := tls.LoadX509KeyPair(c.TLS.CertFile, c.TLS.KeyFile); ckErr == nil {
+		if cert, ckErr := tls.LoadX509KeyPair(c.TLS.CertFile, c.TLS.KeyFile); ckErr != nil {
+			log.Error("tls client cert load failed", "cert", c.TLS.CertFile, "key", c.TLS.KeyFile, "err", ckErr)
+		} else {
 			tlsConf.Certificates = []tls.Certificate{cert}
 		}
 	}
@@ -564,25 +652,35 @@ func buildTLSConfig(c config.Config) *tls.Config {
 	}
 	if c.TLS.InsecureSkipVerify {
 		tlsConf.InsecureSkipVerify = true
+		log.Warn("tls insecure_skip_verify enabled: server certificate is not verified")
 	}
 	return tlsConf
 }
 
-func (r *Runner) openDB(path string) error {
+// reopenDB opens the store for path, reusing the current one when the DSN is
+// unchanged. The caller holds rulesSyncMu so closing the old store cannot race
+// an in-flight rule sync.
+func (r *Runner) reopenDB(path string) (*sqlite.Store, string, error) {
 	dsn := rulesDBDSN(path)
-	if r.db != nil && r.dbPath == dsn {
-		return nil
+	r.mu.RLock()
+	cur, curPath := r.db, r.dbPath
+	r.mu.RUnlock()
+	if cur != nil && curPath == dsn {
+		return cur, dsn, nil
 	}
-	if r.db != nil {
-		_ = r.db.Close()
+	if dir := filepath.Dir(strings.TrimPrefix(path, "file:")); dir != "" && dir != "." {
+		if mkErr := os.MkdirAll(dir, 0o750); mkErr != nil {
+			return nil, "", fmt.Errorf("create rules_db dir %q: %w", dir, mkErr)
+		}
 	}
 	store, err := sqlite.Open(dsn)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	r.db = store
-	r.dbPath = dsn
-	return nil
+	if cur != nil {
+		_ = cur.Close()
+	}
+	return store, dsn, nil
 }
 
 func rulesDBDSN(path string) string {
@@ -603,13 +701,16 @@ func (r *Runner) syncRules(ctx context.Context) error {
 func (r *Runner) syncRulesWithImporter(ctx context.Context, imp rulesImporter) error {
 	r.rulesSyncMu.Lock()
 	defer r.rulesSyncMu.Unlock()
-	if r.db == nil {
+	r.mu.RLock()
+	db := r.db
+	r.mu.RUnlock()
+	if db == nil {
 		return errors.New("rules db not initialized")
 	}
 	if imp == nil {
 		return errors.New("rules importer is nil")
 	}
-	if updErr := r.db.UpdateRules(ctx, func(tx *sql.Tx) error {
+	if updErr := db.UpdateRules(ctx, func(tx *sql.Tx) error {
 		if clearErr := sqlite.ClearRulesTx(ctx, tx); clearErr != nil {
 			return clearErr
 		}
@@ -621,23 +722,29 @@ func (r *Runner) syncRulesWithImporter(ctx context.Context, imp rulesImporter) e
 }
 
 func (r *Runner) selectImporter() (rulesImporter, error) {
-	switch r.cfg.RulesSource {
+	r.mu.RLock()
+	cfg, adcm := r.cfg, r.adcm
+	r.mu.RUnlock()
+	switch cfg.RulesSource {
 	case rulesSourceYAML:
-		return yamlFileImporter{path: r.cfg.RulesPath}, nil
+		return yamlFileImporter{path: cfg.RulesPath}, nil
 	case rulesSourceLegacy:
-		return legacyImporter{legacyDir: r.cfg.LegacyDir, hostID: r.cfg.HostID}, nil
+		return legacyImporter{legacyDir: cfg.LegacyDir, hostID: cfg.HostID}, nil
 	case rulesSourceADCM:
-		return adcmImporter{client: r.adcm, hostID: r.cfg.HostID}, nil
+		return adcmImporter{client: adcm, hostID: cfg.HostID}, nil
 	default:
-		return nil, fmt.Errorf("unsupported rules_source %q", r.cfg.RulesSource)
+		return nil, fmt.Errorf("unsupported rules_source %q", cfg.RulesSource)
 	}
 }
 
 func (r *Runner) loadRulesOnce(ctx context.Context) error {
-	if r.db == nil {
+	r.mu.RLock()
+	db, hostID := r.db, r.cfg.HostID
+	r.mu.RUnlock()
+	if db == nil {
 		return errors.New("rules db not initialized")
 	}
-	rr, err := r.db.LoadRulesForHost(ctx, r.cfg.HostID)
+	rr, err := db.LoadRulesForHost(ctx, hostID)
 	if err != nil {
 		return err
 	}
@@ -655,28 +762,42 @@ func (r *Runner) resetTicker(d time.Duration) {
 		r.clk = realClock{}
 	}
 	r.ticker = r.clk.NewTicker(d)
+	// Wake loop() so it re-reads the new ticker channel; the old one never fires again.
+	select {
+	case r.tickerReset <- struct{}{}:
+	default:
+	}
 }
 
-func (r *Runner) loop(ctx context.Context) {
-	r.scanOnce(ctx)
+func (r *Runner) loop(scanCtx, postCtx context.Context) {
+	r.scanOnce(postCtx)
 	for {
 		r.tickerMu.Lock()
 		c := r.ticker.C()
 		r.tickerMu.Unlock()
 		select {
-		case <-ctx.Done():
+		case <-scanCtx.Done():
 			close(r.jobs)
 			return
 		case <-c:
-			r.scanOnce(ctx)
+			r.scanOnce(postCtx)
+		case <-r.tickerReset:
 		}
 	}
 }
 
 func (r *Runner) scanOnce(ctx context.Context) {
 	cfg, force := r.snapshot()
-	r.scanSystemd(ctx, cfg, force)
-	r.scanDocker(ctx, cfg, force)
+	sd, dck := r.refreshCheckers()
+	// One job per component, aggregating every rule that references it, so a
+	// component listed under both a systemd and a docker rule posts a single
+	// status per scan instead of two rules fighting (0/1 flap).
+	for id, chk := range r.buildScanPlan(ctx, sd) {
+		compID, checks := id, chk
+		r.enqueue(func() {
+			r.evalAndPostComponent(ctx, cfg, compID, checks, sd, dck, force)
+		})
+	}
 	r.sendHeartbeat(ctx, cfg, force)
 }
 
@@ -686,51 +807,92 @@ func (r *Runner) snapshot() (config.Config, time.Duration) {
 	return r.cfg, r.forceAfter
 }
 
-func (r *Runner) scanSystemd(ctx context.Context, cfg config.Config, forceAfter time.Duration) {
+// compChecks is the set of checks a single component depends on, gathered
+// across all rules that reference it.
+type compChecks struct {
+	units      []string
+	dockerSels []rules.DockerSelector
+}
+
+// buildScanPlan maps each component to every check that determines its status.
+// Systemd globs are expanded once here so the per-component job can aggregate.
+func (r *Runner) buildScanPlan(ctx context.Context, sd check.Systemd) map[string]*compChecks {
 	rr := r.ruleStore.Get()
+	plan := make(map[string]*compChecks)
+	get := func(comp string) *compChecks {
+		cc, ok := plan[comp]
+		if !ok {
+			cc = &compChecks{}
+			plan[comp] = cc
+		}
+		return cc
+	}
 	for _, rule := range rr.Systemd {
-		comps := append([]string(nil), rule.Components...)
 		var units []string
 		if rule.Unit != "" {
 			units = append(units, rule.Unit)
 		}
-		if rule.UnitGlob != "" && r.sd != nil {
-			units = append(units, r.sd.ExpandUnitsByGlob(ctx, rule.UnitGlob)...)
+		if rule.UnitGlob != "" && sd != nil {
+			units = append(units, sd.ExpandUnitsByGlob(ctx, rule.UnitGlob)...)
 		}
-		for _, unit := range units {
-			unitLocal := unit
-			r.enqueue(func() {
-				st := 1
-				if r.sd != nil {
-					st = r.sd.SystemdStatus(ctx, unitLocal)
-				}
-				for _, comp := range comps {
-					r.maybePostComponent(ctx, cfg, comp, st, forceAfter)
-				}
-			})
+		for _, comp := range rule.Components {
+			get(comp).units = append(get(comp).units, units...)
 		}
 	}
+	for _, d := range rr.Docker {
+		for _, comp := range d.Components {
+			get(comp).dockerSels = append(get(comp).dockerSels, d.Containers)
+		}
+	}
+	return plan
 }
 
-func (r *Runner) scanDocker(ctx context.Context, cfg config.Config, forceAfter time.Duration) {
-	rr := r.ruleStore.Get()
-	for _, d := range rr.Docker {
-		comps := append([]string(nil), d.Components...)
-		sel := d.Containers
-		r.enqueue(func() {
-			status := 1
-			if r.dck != nil {
-				if len(sel.Names) > 0 {
-					status = r.dck.AllRunningNames(context.Background(), sel.Names)
-				} else {
-					status = r.dck.AllRunningByLabels(context.Background(), sel.Labels)
-				}
+// evalAndPostComponent runs all of a component's checks and posts one aggregated
+// status: down if any determinable check is down, up if all are up. If no check
+// could be evaluated (checker unavailable / infra error), nothing is posted so a
+// transient outage does not flap the component DOWN.
+func (r *Runner) evalAndPostComponent(
+	ctx context.Context,
+	cfg config.Config,
+	compID string,
+	chk *compChecks,
+	sd check.Systemd,
+	dck check.Docker,
+	forceAfter time.Duration,
+) {
+	status := 0
+	determined := false
+	if sd != nil {
+		for _, unit := range chk.units {
+			st := sd.SystemdStatus(ctx, unit)
+			if st == check.UnexpectedExitCode {
+				continue // infra error (dbus timeout/broken), not a real DOWN
 			}
-			for _, comp := range comps {
-				r.maybePostComponent(ctx, cfg, comp, status, forceAfter)
+			determined = true
+			if st != 0 {
+				status = 1
 			}
-		})
+		}
 	}
+	if dck != nil {
+		for _, sel := range chk.dockerSels {
+			determined = true
+			if dockerStatus(ctx, dck, sel) != 0 {
+				status = 1
+			}
+		}
+	}
+	if !determined {
+		return
+	}
+	r.maybePostComponent(ctx, cfg, compID, status, forceAfter)
+}
+
+func dockerStatus(ctx context.Context, dck check.Docker, sel rules.DockerSelector) int {
+	if len(sel.Names) > 0 {
+		return dck.AllRunningNames(ctx, sel.Names)
+	}
+	return dck.AllRunningByLabels(ctx, sel.Labels)
 }
 
 func (r *Runner) sendHeartbeat(ctx context.Context, cfg config.Config, forceAfter time.Duration) {
@@ -756,11 +918,15 @@ func (r *Runner) maybePostComponent(
 	forceAfter time.Duration,
 ) {
 	key := fmt.Sprintf("comp:%d:%s", cfg.HostID, compID)
+	// Serialize per key so concurrent scans of a flapping unit cannot post
+	// out of order or race shouldSend/markSent.
+	unlock := r.postKeys.lock(key)
+	defer unlock()
 	if !r.shouldSend(key, status, forceAfter) {
 		return
 	}
-	if r.post != nil {
-		if err := r.post.PostComponent(ctx, compID, status); err != nil {
+	if post := r.poster(); post != nil {
+		if err := post.PostComponent(ctx, compID, status); err != nil {
 			r.log.WarnContext(ctx, "post component failed", "comp", compID, "err", err)
 			return
 		}
@@ -770,16 +936,24 @@ func (r *Runner) maybePostComponent(
 
 func (r *Runner) maybePostHost(ctx context.Context, cfg config.Config, status int, forceAfter time.Duration) {
 	key := fmt.Sprintf("host:%d", cfg.HostID)
+	unlock := r.postKeys.lock(key)
+	defer unlock()
 	if !r.shouldSend(key, status, forceAfter) {
 		return
 	}
-	if r.post != nil {
-		if err := r.post.PostHost(ctx, status); err != nil {
+	if post := r.poster(); post != nil {
+		if err := post.PostHost(ctx, status); err != nil {
 			r.log.WarnContext(ctx, "post host failed", "host", cfg.HostID, "err", err)
 			return
 		}
 	}
 	r.markSent(key, status)
+}
+
+func (r *Runner) poster() Poster {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.post
 }
 
 func (r *Runner) shouldSend(key string, status int, forceAfter time.Duration) bool {

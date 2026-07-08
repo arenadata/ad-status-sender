@@ -96,6 +96,37 @@ func TestServicesDir_GlobalBasic(t *testing.T) {
 	}
 }
 
+func TestServicesDir_SkipsHostStatusMarker(t *testing.T) {
+	t.Parallel()
+	store, ctx := openTestStore(t)
+	sdir := mkServicesDir(t)
+
+	if err := os.WriteFile(filepath.Join(sdir, "nginx.service"), []byte("1761\n"), 0o644); err != nil {
+		t.Fatalf("write nginx: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sdir, "hoststatus"), []byte("1\n"), 0o644); err != nil {
+		t.Fatalf("write hoststatus: %v", err)
+	}
+
+	err := store.UpdateRules(ctx, func(tx *sql.Tx) error {
+		return ServicesDir(ctx, tx, sdir, "legacy/", nil)
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	rr, err := store.LoadRulesForHost(ctx, 7)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(rr.Systemd) != 1 {
+		t.Fatalf("got %d systemd rules, want 1 (hoststatus skipped)", len(rr.Systemd))
+	}
+	if rr.Systemd[0].Unit != "nginx.service" {
+		t.Fatalf("unexpected unit: %q", rr.Systemd[0].Unit)
+	}
+}
+
 func TestServicesDir_ScopedHosts(t *testing.T) {
 	t.Parallel()
 	store, ctx := openTestStore(t)

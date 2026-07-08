@@ -65,7 +65,10 @@ func (s *Store) Set(r Rules) {
 	s.mu.Unlock()
 }
 
-func Watch(stop <-chan struct{}, path string, apply func(Rules)) error {
+func Watch(stop <-chan struct{}, path string, apply func(Rules), onErr func(error)) error {
+	if onErr == nil {
+		onErr = func(error) {}
+	}
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return err
@@ -96,10 +99,15 @@ func Watch(stop <-chan struct{}, path string, apply func(Rules)) error {
 			}
 		case <-debounce.C:
 			r, loadErr := Load(path)
-			if loadErr == nil {
-				apply(r)
+			if loadErr != nil {
+				onErr(loadErr)
+				continue
 			}
-		case <-w.Errors:
+			apply(r)
+		case werr := <-w.Errors:
+			if werr != nil {
+				onErr(werr)
+			}
 		}
 	}
 }

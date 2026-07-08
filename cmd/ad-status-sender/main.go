@@ -27,7 +27,7 @@ func main() {
 			Level: slog.LevelInfo,
 		}))
 		fallback.Error("failed to load config for logger", "err", err)
-		return
+		os.Exit(1)
 	}
 
 	level := config.ParseSlogLevel(cfg.LogLevel)
@@ -44,7 +44,7 @@ func main() {
 	r := runner.NewWithLogger(cfgPath, logger)
 	if rErr := r.Start(); rErr != nil {
 		logger.Error("start failed", "err", rErr)
-		return
+		os.Exit(1)
 	}
 	_, _ = sd.SdNotify(false, sd.SdNotifyReady)
 
