@@ -35,6 +35,28 @@ A lightweight Go agent that runs **on every host**, collects local statuses (sys
 ad-status-sender -config /etc/ad-status-sender/config.yaml
 ```
 
+## Install (rpm/deb)
+
+The package installs the binary, a default config
+(`/etc/ad-status-sender/config.yaml`, kept on upgrade) and a systemd unit
+(`/usr/lib/systemd/system/ad-status-sender.service`). Post-install runs
+`systemctl daemon-reload`; enabling is left to the operator:
+
+```bash
+systemctl enable --now ad-status-sender
+```
+
+Supply credentials (ADCM user/password, metrics basic-auth password) via a
+systemd drop-in rather than editing the shipped unit:
+
+```ini
+# /etc/systemd/system/ad-status-sender.service.d/creds.conf
+[Service]
+LoadCredential=adcm_user:/etc/ad-status-sender/creds/adcm_user
+LoadCredential=adcm_password:/etc/ad-status-sender/creds/adcm_password
+LoadCredential=metrics_password:/etc/ad-status-sender/creds/metrics_password
+```
+
 ---
 
 ## Configuration (`config.yaml`)

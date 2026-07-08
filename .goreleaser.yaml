@@ -62,6 +62,12 @@ nfpms:
         file_info:
           mode: 0640
 
+      - src: ./init/ad-status-sender.service
+        dst: /usr/lib/systemd/system/ad-status-sender.service
+        type: file
+        file_info:
+          mode: 0644
+
       - dst: /usr/lib/ad-status-sender/bin
         type: dir
         file_info:
@@ -81,6 +87,11 @@ nfpms:
         type: dir
         file_info:
           mode: 0750
+
+    scripts:
+      postinstall: ./packaging/scripts/postinstall.sh
+      preremove: ./packaging/scripts/preremove.sh
+      postremove: ./packaging/scripts/postremove.sh
 
     rpm:
       group: Development/Tools

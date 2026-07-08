@@ -1,0 +1,23 @@
+[Unit]
+Description=ADCM status sender
+Documentation=https://github.com/arenadata/ad-status-sender
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/ad-status-sender/bin/ad-status-sender -config /etc/ad-status-sender/config.yaml
+Restart=on-failure
+RestartSec=5s
+User=root
+
+# For rules_source: adcm with adcm_user/adcm_password (or the metrics basic-auth
+# password), supply credentials via a drop-in rather than editing this unit:
+#   /etc/systemd/system/ad-status-sender.service.d/creds.conf
+#     [Service]
+#     LoadCredential=adcm_user:/etc/ad-status-sender/creds/adcm_user
+#     LoadCredential=adcm_password:/etc/ad-status-sender/creds/adcm_password
+#     LoadCredential=metrics_password:/etc/ad-status-sender/creds/metrics_password
+
+[Install]
+WantedBy=multi-user.target
