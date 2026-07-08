@@ -21,6 +21,27 @@ type TLS struct {
 	InsecureSkipVerify bool   `yaml:"insecure_skip_verify"`
 }
 
+// Metrics configures the optional Prometheus endpoint. It is disabled unless
+// Listen is set. BasicAuth guards the endpoint when a username is given; the
+// listener uses TLS when both cert and key are set.
+type Metrics struct {
+	Listen    string    `yaml:"listen"`
+	Path      string    `yaml:"path"`
+	BasicAuth BasicAuth `yaml:"basic_auth"`
+	TLS       ServerTLS `yaml:"tls"`
+}
+
+type BasicAuth struct {
+	Username     string `yaml:"username"`
+	Password     string `yaml:"password"`
+	PasswordFile string `yaml:"password_file"`
+}
+
+type ServerTLS struct {
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
 type Config struct {
 	ADCMURL        string `yaml:"adcm_url"`
 	HostID         int    `yaml:"host_id"`
@@ -43,12 +64,13 @@ type Config struct {
 	// File logging with rotation. When LogFile is empty the agent logs to
 	// stdout (captured by journald); when set it writes to that file and
 	// rotates it in-process.
-	LogFile       string `yaml:"log_file"`
-	LogMaxSizeMB  int    `yaml:"log_max_size_mb"`  // rotate past this size (default 100)
-	LogMaxBackups int    `yaml:"log_max_backups"`  // rotated files to keep (default 7)
-	LogMaxAgeDays int    `yaml:"log_max_age_days"` // delete rotated older than N days (default 28)
-	LogCompress   *bool  `yaml:"log_compress"`     // gzip rotated files (default true)
-	TLS           TLS    `yaml:"tls"`
+	LogFile       string  `yaml:"log_file"`
+	LogMaxSizeMB  int     `yaml:"log_max_size_mb"`  // rotate past this size (default 100)
+	LogMaxBackups int     `yaml:"log_max_backups"`  // rotated files to keep (default 7)
+	LogMaxAgeDays int     `yaml:"log_max_age_days"` // delete rotated older than N days (default 28)
+	LogCompress   *bool   `yaml:"log_compress"`     // gzip rotated files (default true)
+	TLS           TLS     `yaml:"tls"`
+	Metrics       Metrics `yaml:"metrics"`
 }
 
 // Log rotation defaults, applied when log_file is set.
@@ -109,7 +131,50 @@ func Load(path string) (Config, error) {
 	if err := validateDurations(&c); err != nil {
 		return Config{}, err
 	}
+	if err := validateMetrics(&c); err != nil {
+		return Config{}, err
+	}
 	return c, nil
+}
+
+// MetricsEnabled reports whether the Prometheus endpoint should be started.
+func (c *Config) MetricsEnabled() bool {
+	return strings.TrimSpace(c.Metrics.Listen) != ""
+}
+
+// validateMetrics rejects a half-configured TLS pair; the password is resolved
+// lazily (systemd cred / file) so it is not required to be inline here.
+func validateMetrics(c *Config) error {
+	if !c.MetricsEnabled() {
+		return nil
+	}
+	t := c.Metrics.TLS
+	if (t.CertFile == "") != (t.KeyFile == "") {
+		return errors.New("metrics.tls cert_file and key_file must be set together")
+	}
+	return nil
+}
+
+// LoadMetricsPassword resolves the basic-auth password from config, systemd
+// credentials (metrics_password), or password_file, in that order.
+func LoadMetricsPassword(c *Config) (string, error) {
+	if p := strings.TrimSpace(c.Metrics.BasicAuth.Password); p != "" {
+		return p, nil
+	}
+	if dir := os.Getenv("CREDENTIALS_DIRECTORY"); dir != "" {
+		//nolint:gosec // G304: literal filename under systemd CREDENTIALS_DIRECTORY, no traversal
+		if b, err := os.ReadFile(filepath.Join(dir, "metrics_password")); err == nil {
+			return strings.TrimSpace(string(b)), nil
+		}
+	}
+	if f := strings.TrimSpace(c.Metrics.BasicAuth.PasswordFile); f != "" {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	return "", errors.New("no metrics basic-auth password provided")
 }
 
 // applyLogDefaults fills rotation defaults so retention is always bounded when
