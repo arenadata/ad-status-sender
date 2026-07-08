@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/arenadata/ad-status-sender/internal/adcmclient"
 	"github.com/arenadata/ad-status-sender/internal/check"
 	"github.com/arenadata/ad-status-sender/internal/config"
+	"github.com/arenadata/ad-status-sender/internal/metrics"
 	"github.com/arenadata/ad-status-sender/internal/rules"
 	"github.com/arenadata/ad-status-sender/internal/storage/sqlite"
 	"github.com/fsnotify/fsnotify"
@@ -52,6 +54,7 @@ const (
 type Runner struct {
 	cfgPath string
 	log     *slog.Logger
+	metrics *metrics.Metrics
 
 	mu     sync.RWMutex
 	cfg    config.Config
@@ -143,6 +146,10 @@ func NewWithDeps(
 		clk:     clk,
 	}
 }
+
+// SetMetrics attaches a metrics sink; call before Start. A nil sink disables
+// instrumentation (all observer calls no-op).
+func (r *Runner) SetMetrics(m *metrics.Metrics) { r.metrics = m }
 
 func (r *Runner) Start() error {
 	if err := r.reload(); err != nil {
@@ -236,7 +243,6 @@ func (r *Runner) startRulesWatcher() {
 				r.log.Error("rules import", "err", syncErr)
 				return
 			}
-			r.log.Info("rules reloaded", "systemd", len(rr.Systemd), "docker", len(rr.Docker))
 		}, func(werr error) {
 			r.log.Error("rules watch", "err", werr)
 		})
@@ -554,6 +560,7 @@ func (r *Runner) ensureToken(auth authConfig, httpc *http.Client) (string, error
 		return "", auth.credErr
 	}
 	tmp := adcmclient.New(auth.cfg.ADCMURL, "", httpc, r.log)
+	tmp.OnTokenFetch = r.metrics.ObserveTokenFetch
 	ctx, cancel := context.WithTimeout(
 		context.Background(),
 		config.MustDuration(auth.cfg.HTTPTimeout, defaultHTTPTimeout),
@@ -597,6 +604,7 @@ func (r *Runner) buildADCMClient(auth authConfig, token string, httpc *http.Clie
 		return "", err
 	}
 	client = adcmclient.NewWithTokenProvider(auth.cfg.ADCMURL, token, tokenProvider, httpc, r.log)
+	client.OnTokenFetch = r.metrics.ObserveTokenFetch
 	// adcm mode needs both rbac (rule import) and the status secret (POSTs); fetch
 	// the latter from the status-checker-token endpoint. Other sources deploy the
 	// secret as token, so status POSTs fall back to it with no provider.
@@ -699,6 +707,12 @@ func (r *Runner) syncRules(ctx context.Context) error {
 }
 
 func (r *Runner) syncRulesWithImporter(ctx context.Context, imp rulesImporter) error {
+	err := r.importAndLoadRules(ctx, imp)
+	r.metrics.ObserveRefresh(err)
+	return err
+}
+
+func (r *Runner) importAndLoadRules(ctx context.Context, imp rulesImporter) error {
 	r.rulesSyncMu.Lock()
 	defer r.rulesSyncMu.Unlock()
 	r.mu.RLock()
@@ -748,8 +762,64 @@ func (r *Runner) loadRulesOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	prev := r.ruleStore.Get()
 	r.ruleStore.Set(rr)
+	r.metrics.SetRules(len(rr.Systemd), len(rr.Docker))
+	r.logRuleChanges(prev, rr)
 	return nil
+}
+
+// logRuleChanges reports which monitored units/groups appeared or disappeared
+// between reloads (e.g. a service installed or removed in ADCM). The first load
+// logs a summary; unchanged reloads log nothing to avoid per-refresh noise.
+func (r *Runner) logRuleChanges(prev, cur rules.Rules) {
+	before := ruleUnitSet(prev)
+	if len(before) == 0 {
+		r.log.Info("rules loaded", "systemd", len(cur.Systemd), "docker", len(cur.Docker))
+		return
+	}
+	after := ruleUnitSet(cur)
+	added := setDiff(after, before)
+	removed := setDiff(before, after)
+	if len(added) == 0 && len(removed) == 0 {
+		return
+	}
+	r.log.Info("rules changed",
+		"added", added, "removed", removed,
+		"systemd", len(cur.Systemd), "docker", len(cur.Docker))
+}
+
+// ruleUnitSet is the set of monitored identities in a rule set: systemd units
+// (or globs) and docker group names (prefixed to avoid colliding with units).
+func ruleUnitSet(rr rules.Rules) map[string]struct{} {
+	out := make(map[string]struct{}, len(rr.Systemd)+len(rr.Docker))
+	for _, s := range rr.Systemd {
+		id := s.Unit
+		if id == "" {
+			id = s.UnitGlob
+		}
+		if id != "" {
+			out[id] = struct{}{}
+		}
+	}
+	for _, d := range rr.Docker {
+		if d.Name != "" {
+			out["docker:"+d.Name] = struct{}{}
+		}
+	}
+	return out
+}
+
+// setDiff returns the sorted keys present in a but not in b.
+func setDiff(a, b map[string]struct{}) []string {
+	var out []string
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r *Runner) resetTicker(d time.Duration) {
@@ -940,11 +1010,15 @@ func (r *Runner) maybePostComponent(
 		return
 	}
 	if post := r.poster(); post != nil {
-		if err := post.PostComponent(ctx, hostID, target.compID, status); err != nil {
+		start := time.Now()
+		err := post.PostComponent(ctx, hostID, target.compID, status)
+		r.metrics.ObserveSend("component", time.Since(start), err)
+		if err != nil {
 			r.log.WarnContext(ctx, "post component failed", "host", hostID, "comp", target.compID, "err", err)
 			return
 		}
 	}
+	r.metrics.SetComponentStatus(hostID, target.compID, status)
 	r.markSent(key, status)
 }
 
@@ -956,11 +1030,15 @@ func (r *Runner) maybePostHost(ctx context.Context, cfg config.Config, status in
 		return
 	}
 	if post := r.poster(); post != nil {
-		if err := post.PostHost(ctx, status); err != nil {
+		start := time.Now()
+		err := post.PostHost(ctx, status)
+		r.metrics.ObserveSend("host", time.Since(start), err)
+		if err != nil {
 			r.log.WarnContext(ctx, "post host failed", "host", cfg.HostID, "err", err)
 			return
 		}
 	}
+	r.metrics.SetHostStatus(cfg.HostID, status)
 	r.markSent(key, status)
 }
 

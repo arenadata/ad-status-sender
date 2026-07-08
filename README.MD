@@ -17,6 +17,7 @@ A lightweight Go agent that runs **on every host**, collects local statuses (sys
 - **TLS/HTTPS**: custom CA, mTLS (client cert/key), `server_name` override, `insecure_skip_verify`.
 - Token from YAML, **token file**, or **systemd credentials**.
 - Worker pool, stable HTTP timeouts.
+- Optional **Prometheus metrics** endpoint (opt-in), with basic auth and TLS.
 
 ---
 
@@ -32,6 +33,28 @@ A lightweight Go agent that runs **on every host**, collects local statuses (sys
 
 ```bash
 ad-status-sender -config /etc/ad-status-sender/config.yaml
+```
+
+## Install (rpm/deb)
+
+The package installs the binary, a default config
+(`/etc/ad-status-sender/config.yaml`, kept on upgrade) and a systemd unit
+(`/usr/lib/systemd/system/ad-status-sender.service`). Post-install runs
+`systemctl daemon-reload`; enabling is left to the operator:
+
+```bash
+systemctl enable --now ad-status-sender
+```
+
+Supply credentials (ADCM user/password, metrics basic-auth password) via a
+systemd drop-in rather than editing the shipped unit:
+
+```ini
+# /etc/systemd/system/ad-status-sender.service.d/creds.conf
+[Service]
+LoadCredential=adcm_user:/etc/ad-status-sender/creds/adcm_user
+LoadCredential=adcm_password:/etc/ad-status-sender/creds/adcm_password
+LoadCredential=metrics_password:/etc/ad-status-sender/creds/metrics_password
 ```
 
 ---
@@ -284,6 +307,45 @@ size-based; old files are pruned by count (`log_max_backups`) and age
 (`log_max_age_days`).
 
 If `log_bodies: true`, the agent logs server response bodies (useful for debugging).
+
+---
+
+## Metrics (Prometheus)
+
+Disabled by default. Set `metrics.listen` to expose a `/metrics` endpoint on its
+own listener (separate from the ADCM client):
+
+```yaml
+metrics:
+  listen: ":9187"          # empty/absent = disabled
+  path: "/metrics"         # default /metrics
+  basic_auth:
+    username: "prom"
+    # password source, in order: password | systemd cred metrics_password | password_file
+    password_file: "/etc/ad-status-sender/metrics.pass"
+  tls:                     # server TLS for the endpoint; cert + key must be set together
+    cert_file: "/etc/ad-status-sender/metrics.crt"
+    key_file: "/etc/ad-status-sender/metrics.key"
+```
+
+Basic auth is enabled only when `basic_auth.username` is set. TLS is enabled only
+when both `cert_file` and `key_file` are set. With systemd, deploy the password as
+a credential (`LoadCredential=metrics_password:...`) rather than inline YAML.
+
+Exposed series (prefix `ad_status_sender_`):
+
+| metric | type | labels | meaning |
+|---|---|---|---|
+| `up` | gauge | — | 1 while running |
+| `send_total` | counter | `target` (host/component), `result` (ok/error) | status POST outcomes |
+| `send_duration_seconds` | histogram | `target` | status POST latency |
+| `entity_status` | gauge | `kind`, `id` | last posted status (0 up, 1 down) |
+| `rules` | gauge | `kind` (systemd/docker) | loaded rule counts |
+| `rules_refresh_total` | counter | `result` | rule imports |
+| `rules_last_refresh_timestamp_seconds` | gauge | — | unix time of last successful import |
+| `token_fetch_total` | counter | `kind` (rbac/status), `result` | token fetches |
+
+Metrics settings are read at startup and are **not** re-read on SIGHUP.
 
 ---
 

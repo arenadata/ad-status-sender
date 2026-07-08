@@ -71,6 +71,11 @@ type Client struct {
 	statusTokenProvider TokenProvider
 	statusProbeAfter    time.Time
 	statusFetchMu       sync.Mutex
+
+	// OnTokenFetch, if set, is called after each token fetch with the token kind
+	// ("rbac"/"status") and the fetch error (nil on success). Optional; used for
+	// metrics. Set before sharing the client.
+	OnTokenFetch func(kind string, err error)
 }
 
 func New(baseURL, token string, httpClient *http.Client, logger *slog.Logger) *Client {
@@ -95,6 +100,12 @@ func NewWithTokenProvider(
 		tokenProvider: tokenProvider,
 		http:          httpClient,
 		log:           logger,
+	}
+}
+
+func (c *Client) reportTokenFetch(kind string, err error) {
+	if c.OnTokenFetch != nil {
+		c.OnTokenFetch(kind, err)
 	}
 }
 
@@ -259,6 +270,12 @@ func (c *Client) refetchStatusToken(ctx context.Context) (string, bool) {
 // ObtainStatusToken fetches the status secret from the ADCM status-checker-token
 // endpoint using the rbac token.
 func (c *Client) ObtainStatusToken(ctx context.Context) (string, error) {
+	tok, err := c.fetchStatusToken(ctx)
+	c.reportTokenFetch("status", err)
+	return tok, err
+}
+
+func (c *Client) fetchStatusToken(ctx context.Context) (string, error) {
 	headers := map[string]string{headerAccept: mimeJSON}
 	resp, err := c.doWithAuthRetry(ctx, http.MethodPost, c.baseURL+statusCheckerTokenPath, nil, headers)
 	if err != nil {
@@ -486,11 +503,12 @@ func (c *Client) sameOrigin(u *url.URL) bool {
 // ObtainToken posts to the ADCM token endpoint and returns a token.
 func (c *Client) ObtainToken(ctx context.Context, user, pass string) (string, error) {
 	token, err := c.tryTokenEndpoint(ctx, "/api/v2/token/", user, pass)
+	if err == nil && token == "" {
+		err = errors.New("token endpoint returned empty token")
+	}
+	c.reportTokenFetch("rbac", err)
 	if err != nil {
 		return "", err
-	}
-	if token == "" {
-		return "", errors.New("token endpoint returned empty token")
 	}
 	return token, nil
 }
