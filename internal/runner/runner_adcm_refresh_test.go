@@ -61,6 +61,12 @@ func TestRunner_ADCMRefreshSyncer(t *testing.T) {
 					{"id": 100, "isCurrent": true},
 				},
 			})
+		case "/api/v2/clusters/10/services/55/components/":
+			writeJSON(w, map[string]any{
+				"results": []map[string]any{
+					{"id": 101, "name": "rest"},
+				},
+			})
 		case "/api/v2/clusters/10/services/55/configs/100/":
 			unit := state.getUnit()
 			comp := map[string]string{
