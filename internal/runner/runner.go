@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -236,7 +237,6 @@ func (r *Runner) startRulesWatcher() {
 				r.log.Error("rules import", "err", syncErr)
 				return
 			}
-			r.log.Info("rules reloaded", "systemd", len(rr.Systemd), "docker", len(rr.Docker))
 		}, func(werr error) {
 			r.log.Error("rules watch", "err", werr)
 		})
@@ -748,8 +748,63 @@ func (r *Runner) loadRulesOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	prev := r.ruleStore.Get()
 	r.ruleStore.Set(rr)
+	r.logRuleChanges(prev, rr)
 	return nil
+}
+
+// logRuleChanges reports which monitored units/groups appeared or disappeared
+// between reloads (e.g. a service installed or removed in ADCM). The first load
+// logs a summary; unchanged reloads log nothing to avoid per-refresh noise.
+func (r *Runner) logRuleChanges(prev, cur rules.Rules) {
+	before := ruleUnitSet(prev)
+	if len(before) == 0 {
+		r.log.Info("rules loaded", "systemd", len(cur.Systemd), "docker", len(cur.Docker))
+		return
+	}
+	after := ruleUnitSet(cur)
+	added := setDiff(after, before)
+	removed := setDiff(before, after)
+	if len(added) == 0 && len(removed) == 0 {
+		return
+	}
+	r.log.Info("rules changed",
+		"added", added, "removed", removed,
+		"systemd", len(cur.Systemd), "docker", len(cur.Docker))
+}
+
+// ruleUnitSet is the set of monitored identities in a rule set: systemd units
+// (or globs) and docker group names (prefixed to avoid colliding with units).
+func ruleUnitSet(rr rules.Rules) map[string]struct{} {
+	out := make(map[string]struct{}, len(rr.Systemd)+len(rr.Docker))
+	for _, s := range rr.Systemd {
+		id := s.Unit
+		if id == "" {
+			id = s.UnitGlob
+		}
+		if id != "" {
+			out[id] = struct{}{}
+		}
+	}
+	for _, d := range rr.Docker {
+		if d.Name != "" {
+			out["docker:"+d.Name] = struct{}{}
+		}
+	}
+	return out
+}
+
+// setDiff returns the sorted keys present in a but not in b.
+func setDiff(a, b map[string]struct{}) []string {
+	var out []string
+	for k := range a {
+		if _, ok := b[k]; !ok {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (r *Runner) resetTicker(d time.Duration) {
