@@ -7,6 +7,7 @@ A lightweight Go agent that runs **on every host**, collects local statuses (sys
 ## Features
 
 - SQLite-backed rules database with multiple sources: `rules.yaml`, `configs/legacy`, or ADCM.
+- **ADCM shared hosts**: a machine shared into several clusters as host duplicates is fully covered — component status is posted per duplicate (ADCM fans out host status server-side, but not component status).
 - **Hot reload** of rules:
   - `yaml`: `fsnotify` on `rules.yaml`
   - `legacy`: `fsnotify` on `legacy_dir` (services/docker/hosts)
@@ -220,11 +221,26 @@ Changes in these folders trigger a sync into SQLite.
 
 ### 3) ADCM
 Rules are built from ADCM service configs:
-- for each component of the current host, the service config is inspected for
+- for each component mapped to the host, the service config is inspected for
   `components.<component>.systemd.service_name`
 - this becomes a systemd rule (`<service_name>.service` if missing suffix)
 
 Refresh happens on a timer (`rules_refresh_interval`).
+
+**Shared hosts (host duplicates).** A single machine can be shared into several
+clusters as duplicate hosts, each carrying its own components. ADCM fans out
+*host* status to duplicates server-side, but **not** component status, so the
+agent enumerates the original host plus every duplicate and posts each
+duplicate's component status under that duplicate's host id. Set `host_id` to the
+**original** host id — duplicates are discovered automatically. A duplicate that
+is deleted or forbidden (404/403) is skipped; a transient failure (5xx/network)
+aborts the refresh so previously imported rules are preserved rather than wiped.
+
+**Status authentication (two domains).** ADCM authenticates `/api/v2/*` (rule
+import) with the rbac token, but `/status/api/v1/*` status POSTs with a separate
+shared secret. In `adcm` mode the agent fetches that secret from
+`POST /api/v2/adcm/status-checker-token/`, caches it, refetches on `401`, and
+falls back to the configured token when the endpoint is absent (older ADCM).
 
 ---
 
@@ -270,6 +286,33 @@ We target strict settings:
 ```bash
 golangci-lint run
 ```
+
+---
+
+## Tests
+
+Unit tests are fast and need no external services:
+
+```bash
+go test ./...
+```
+
+Live-ADCM integration tests boot a real ADCM + Postgres via testcontainers
+(require Docker) and are gated behind the `adcm_integration` build tag, so the
+default `go test ./...` never runs them:
+
+```bash
+# shared-host import contract against a released ADCM image
+go test -tags adcm_integration -run TestSharedHost ./internal/adcmclient/
+
+# status-checker-token / two-domain status auth — needs an ADCM image that
+# ships the endpoint (feature/status-token-api build), selected via ADCM_TC_IMAGE
+ADCM_TC_IMAGE=hub.adsw.io/adcm/adcm:feature_status-token-api \
+  go test -tags adcm_integration -run TestStatus ./internal/adcmclient/
+```
+
+The `TestStatus*` tests skip when `ADCM_TC_IMAGE` is unset (released images lack
+the endpoint). Provisioning bundles live under `internal/adcmclient/testdata/`.
 
 ---
 
