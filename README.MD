@@ -265,7 +265,24 @@ HTTP client:
 
 ## Logging
 
-Structured logs via `log/slog` to stdout.  
+Structured logs via `log/slog`. By default the agent logs to **stdout**
+(captured by journald under systemd).
+
+Set `log_file` to write to a file with **in-process rotation** instead (no
+external `logrotate` needed):
+
+```yaml
+log_file: "/var/log/ad-status-sender/ad-status-sender.log"
+log_max_size_mb: 100    # rotate once the file exceeds this size (default 100)
+log_max_backups: 7      # rotated files to keep (default 7)
+log_max_age_days: 28    # delete rotated files older than N days (default 28)
+log_compress: true      # gzip rotated files (default true)
+```
+
+The package ships `/var/log/ad-status-sender/` (mode `0750`). Rotation is
+size-based; old files are pruned by count (`log_max_backups`) and age
+(`log_max_age_days`).
+
 If `log_bodies: true`, the agent logs server response bodies (useful for debugging).
 
 ---

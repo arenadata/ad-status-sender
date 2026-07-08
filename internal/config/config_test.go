@@ -127,3 +127,67 @@ legacy_dir: "/tmp/legacy"
 		t.Fatalf("load failed: %v", err)
 	}
 }
+
+func loadYAML(t *testing.T, yml string) Config {
+	t.Helper()
+	fn := filepath.Join(t.TempDir(), "cfg.yaml")
+	if err := os.WriteFile(fn, []byte(yml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(fn)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	return cfg
+}
+
+func TestLoad_LogRotationDefaults(t *testing.T) {
+	// log_file set, rotation knobs omitted -> bounded defaults + compress on.
+	cfg := loadYAML(t, `
+adcm_url: "http://localhost"
+host_id: 1
+rules_db: "/tmp/rules.db"
+rules_source: "adcm"
+log_file: "/var/log/ad-status-sender/x.log"
+`)
+	if cfg.LogMaxSizeMB != defaultLogMaxSizeMB ||
+		cfg.LogMaxBackups != defaultLogMaxBackups ||
+		cfg.LogMaxAgeDays != defaultLogMaxAgeDays {
+		t.Fatalf("defaults not applied: %+v", cfg)
+	}
+	if !cfg.LogCompressEnabled() {
+		t.Fatal("compress should default to true")
+	}
+}
+
+func TestLoad_LogRotationExplicit(t *testing.T) {
+	cfg := loadYAML(t, `
+adcm_url: "http://localhost"
+host_id: 1
+rules_db: "/tmp/rules.db"
+rules_source: "adcm"
+log_file: "/var/log/ad-status-sender/x.log"
+log_max_size_mb: 5
+log_max_backups: 3
+log_max_age_days: 2
+log_compress: false
+`)
+	if cfg.LogMaxSizeMB != 5 || cfg.LogMaxBackups != 3 || cfg.LogMaxAgeDays != 2 {
+		t.Fatalf("explicit values not honored: %+v", cfg)
+	}
+	if cfg.LogCompressEnabled() {
+		t.Fatal("compress:false must disable gzip")
+	}
+}
+
+func TestLoad_NoLogFile_NoDefaults(t *testing.T) {
+	cfg := loadYAML(t, `
+adcm_url: "http://localhost"
+host_id: 1
+rules_db: "/tmp/rules.db"
+rules_source: "adcm"
+`)
+	if cfg.LogFile != "" || cfg.LogMaxSizeMB != 0 {
+		t.Fatalf("no log_file must leave rotation unset: %+v", cfg)
+	}
+}

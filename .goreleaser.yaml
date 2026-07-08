@@ -77,6 +77,11 @@ nfpms:
         file_info:
           mode: 0750
 
+      - dst: /var/log/ad-status-sender
+        type: dir
+        file_info:
+          mode: 0750
+
     rpm:
       group: Development/Tools
       packager: Arenadata Team <team@arenadata.com>

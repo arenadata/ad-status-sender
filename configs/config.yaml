@@ -21,6 +21,14 @@ force_send_after: "240s"
 log_level: "info"   # one of: debug, info, warn, error
 log_format: "text"  # or: json
 
+# File logging with in-process rotation. Leave log_file empty to log to stdout
+# (captured by journald). When set, logs go to the file and are rotated.
+# log_file: "/var/log/ad-status-sender/ad-status-sender.log"
+# log_max_size_mb: 100    # rotate once the file exceeds this size (default 100)
+# log_max_backups: 7      # rotated files to keep (default 7)
+# log_max_age_days: 28    # delete rotated files older than N days (default 28)
+# log_compress: true      # gzip rotated files (default true)
+
 tls:
   ca_file: "/etc/pki/ca-trust/source/anchors/adcm-root.pem"  
   cert_file: "/etc/ad-status-sender/client.crt"               

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,6 +12,7 @@ import (
 	"github.com/arenadata/ad-status-sender/internal/config"
 	"github.com/arenadata/ad-status-sender/internal/runner"
 	sd "github.com/coreos/go-systemd/v22/daemon"
+	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
 
 func main() {
@@ -31,13 +33,14 @@ func main() {
 	}
 
 	level := config.ParseSlogLevel(cfg.LogLevel)
+	logOut := logWriter(cfg)
 
 	var handler slog.Handler
 	switch cfg.LogFormat {
 	case "json":
-		handler = slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+		handler = slog.NewJSONHandler(logOut, &slog.HandlerOptions{Level: level})
 	default:
-		handler = slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level})
+		handler = slog.NewTextHandler(logOut, &slog.HandlerOptions{Level: level})
 	}
 	logger := slog.New(handler)
 
@@ -53,4 +56,18 @@ func main() {
 
 	<-ctx.Done()
 	r.Stop()
+}
+
+// logWriter returns stdout, or a size-rotating file writer when log_file is set.
+func logWriter(cfg config.Config) io.Writer {
+	if cfg.LogFile == "" {
+		return os.Stdout
+	}
+	return &lumberjack.Logger{
+		Filename:   cfg.LogFile,
+		MaxSize:    cfg.LogMaxSizeMB,
+		MaxBackups: cfg.LogMaxBackups,
+		MaxAge:     cfg.LogMaxAgeDays,
+		Compress:   cfg.LogCompressEnabled(),
+	}
 }

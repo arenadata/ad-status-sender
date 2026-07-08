@@ -10,6 +10,7 @@ require (
 	github.com/godbus/dbus/v5 v5.2.2
 	github.com/pressly/goose/v3 v3.27.2
 	github.com/testcontainers/testcontainers-go v0.43.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	modernc.org/sqlite v1.53.0
 )
 

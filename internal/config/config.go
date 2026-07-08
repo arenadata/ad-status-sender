@@ -40,8 +40,23 @@ type Config struct {
 	ForceSendAfter string `yaml:"force_send_after"`
 	LogLevel       string `yaml:"log_level"`
 	LogFormat      string `yaml:"log_format"` // "text" or "json"
-	TLS            TLS    `yaml:"tls"`
+	// File logging with rotation. When LogFile is empty the agent logs to
+	// stdout (captured by journald); when set it writes to that file and
+	// rotates it in-process.
+	LogFile       string `yaml:"log_file"`
+	LogMaxSizeMB  int    `yaml:"log_max_size_mb"`  // rotate past this size (default 100)
+	LogMaxBackups int    `yaml:"log_max_backups"`  // rotated files to keep (default 7)
+	LogMaxAgeDays int    `yaml:"log_max_age_days"` // delete rotated older than N days (default 28)
+	LogCompress   *bool  `yaml:"log_compress"`     // gzip rotated files (default true)
+	TLS           TLS    `yaml:"tls"`
 }
+
+// Log rotation defaults, applied when log_file is set.
+const (
+	defaultLogMaxSizeMB  = 100
+	defaultLogMaxBackups = 7
+	defaultLogMaxAgeDays = 28
+)
 
 func MustDuration(s string, def time.Duration) time.Duration {
 	if strings.TrimSpace(s) == "" {
@@ -90,10 +105,34 @@ func Load(path string) (Config, error) {
 	if c.Concurrency <= 0 {
 		c.Concurrency = runtime.NumCPU()
 	}
+	applyLogDefaults(&c)
 	if err := validateDurations(&c); err != nil {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+// applyLogDefaults fills rotation defaults so retention is always bounded when
+// file logging is enabled (lumberjack's own zero-values mean "keep forever").
+func applyLogDefaults(c *Config) {
+	if c.LogFile == "" {
+		return
+	}
+	if c.LogMaxSizeMB <= 0 {
+		c.LogMaxSizeMB = defaultLogMaxSizeMB
+	}
+	if c.LogMaxBackups <= 0 {
+		c.LogMaxBackups = defaultLogMaxBackups
+	}
+	if c.LogMaxAgeDays <= 0 {
+		c.LogMaxAgeDays = defaultLogMaxAgeDays
+	}
+}
+
+// LogCompressEnabled reports whether rotated files should be gzipped; defaults
+// to true when log_compress is omitted.
+func (c *Config) LogCompressEnabled() bool {
+	return c.LogCompress == nil || *c.LogCompress
 }
 
 // validateDurations rejects malformed duration strings at load time so runtime
